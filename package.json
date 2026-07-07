@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "prebuild": "prisma generate",
-    "build": "nest build",
+    "build": "prisma generate && nest build",
     "start": "node dist/src/main",
     "start:prod": "prisma migrate deploy && node dist/src/main",
     "start:dev": "nest start --watch",
