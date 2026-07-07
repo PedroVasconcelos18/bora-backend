@@ -1,0 +1,13 @@
+// Prisma 7 schema — generator must specify moduleFormat = "cjs" for NestJS (CommonJS) compatibility.
+// No Rust engine in Prisma 7: driver adapter (@prisma/adapter-pg) is required.
+// datasource url is now configured in prisma.config.ts (Prisma 7 breaking change).
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
