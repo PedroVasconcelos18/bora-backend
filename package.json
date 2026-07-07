@@ -4,10 +4,13 @@
   "description": "Bora backend — NestJS 11 + Prisma 7 + PostgreSQL 17",
   "private": true,
   "scripts": {
+    "prebuild": "prisma generate",
     "build": "nest build",
-    "start": "node dist/main",
+    "start": "node dist/src/main",
+    "start:prod": "prisma migrate deploy && node dist/src/main",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
+    "postinstall": "prisma generate",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\"",
     "test": "jest",
     "test:e2e": "jest --config ./test/jest-e2e.json"
