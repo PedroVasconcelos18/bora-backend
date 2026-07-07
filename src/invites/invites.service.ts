@@ -1,0 +1,103 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../prisma/prisma.service';
+import { IEmailProvider } from '../email/interfaces/email-provider.interface';
+
+export interface InviteWithLink {
+  inviteId: string;
+  token: string;
+  targetEmail: string;
+  copyableLink: string;
+}
+
+@Injectable()
+export class InvitesService {
+  private readonly logger = new Logger(InvitesService.name);
+  private readonly appDomain: string;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+    @Inject('EMAIL_PROVIDER') private readonly emailProvider: IEmailProvider,
+  ) {
+    // Use FRONTEND_URL to build invite links; fall back to localhost for dev
+    this.appDomain =
+      this.config.get<string>('FRONTEND_URL') ?? 'http://localhost:5173';
+  }
+
+  /**
+   * Create Invite rows for a list of emails and dispatch invitation emails.
+   * Returns copyable invite links for each invitee.
+   *
+   * NOTE: This method does NOT create the Invite rows — the caller (ChallengesService)
+   * creates them inside a $transaction. This method takes already-persisted invite
+   * tokens and dispatches emails + returns the links.
+   */
+  async dispatchInvites(
+    challengeId: string,
+    challengeTitle: string,
+    challengeEmoji: string,
+    invites: Array<{ token: string; targetEmail: string }>,
+  ): Promise<InviteWithLink[]> {
+    const results: InviteWithLink[] = [];
+
+    for (const invite of invites) {
+      const copyableLink = `${this.appDomain}/invites/${invite.token}`;
+
+      // Send invite email (dev mode: logs to console if RESEND_API_KEY unset)
+      try {
+        await this.emailProvider.send({
+          to: invite.targetEmail,
+          subject: `${challengeEmoji} Você foi convidado para o desafio "${challengeTitle}" no Bora`,
+          html: this.buildInviteEmailHtml({
+            challengeTitle,
+            challengeEmoji,
+            copyableLink,
+          }),
+        });
+      } catch (err) {
+        // Email failure must not abort the creation flow — log and continue
+        this.logger.error(
+          `Failed to send invite email to ${invite.targetEmail}: ${String(err)}`,
+        );
+      }
+
+      results.push({
+        inviteId: challengeId,
+        token: invite.token,
+        targetEmail: invite.targetEmail,
+        copyableLink,
+      });
+    }
+
+    return results;
+  }
+
+  private buildInviteEmailHtml(params: {
+    challengeTitle: string;
+    challengeEmoji: string;
+    copyableLink: string;
+  }): string {
+    return `
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family: 'Plus Jakarta Sans', Arial, sans-serif; background: #EFE8DA; padding: 24px;">
+  <div style="max-width: 480px; margin: 0 auto; background: #FAF7F0; border-radius: 20px; padding: 28px; box-shadow: 0 18px 40px -22px rgba(11,59,34,.42);">
+    <div style="text-align: center; margin-bottom: 20px;">
+      <div style="font-size: 3rem;">${params.challengeEmoji}</div>
+      <h1 style="font-family: 'Baloo 2', sans-serif; color: #0B3B22; margin: 8px 0 4px;">${params.challengeTitle}</h1>
+      <p style="color: #5C6B61; font-size: 14px;">Você foi convidado para um desafio de hábito!</p>
+    </div>
+    <a href="${params.copyableLink}" style="display: block; background: #2BD86B; color: #0B3B22; text-decoration: none; padding: 14px 22px; border-radius: 16px; text-align: center; font-weight: 700; font-size: 16px; margin-bottom: 16px;">
+      Aceitar convite
+    </a>
+    <p style="font-size: 13px; color: #5C6B61; text-align: center;">Ou copie este link: <a href="${params.copyableLink}" style="color: #12B85C;">${params.copyableLink}</a></p>
+    <div style="margin-top: 20px; background: #16241C; color: #FAF7F0; border-radius: 14px; padding: 14px 16px; font-size: 12px; line-height: 1.5;">
+      O <strong style="color: #2BD86B;">Bora</strong> é uma plataforma de gerenciamento de desafios de hábito entre amigos. <strong style="color: #2BD86B;">Não é aposta nem bolão</strong>: a colaboração funciona como incentivo e volta pra quem mantém o hábito combinado.
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+}

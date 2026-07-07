@@ -19,8 +19,76 @@ model User {
   passwordHash  String         @map("password_hash")
   createdAt     DateTime       @default(now()) @map("created_at")
   refreshTokens RefreshToken[]
+  participants  Participant[]
+  challenges    Challenge[]    @relation("CreatedChallenges")
 
   @@map("users")
+}
+
+model Challenge {
+  id            String          @id @default(uuid())
+  title         String
+  emoji         String
+  durationDays  Int             @map("duration_days")
+  collabAmount  Decimal         @map("collab_amount") @db.Decimal(10, 2)
+  platformFee   Decimal         @default(10) @map("platform_fee") @db.Decimal(10, 2)
+  status        ChallengeStatus @default(WAITING)
+  creatorId     String          @map("creator_id")
+  creator       User            @relation("CreatedChallenges", fields: [creatorId], references: [id])
+  participants  Participant[]
+  invites       Invite[]
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  @@map("challenges")
+}
+
+model Participant {
+  id          String            @id @default(uuid())
+  challengeId String            @map("challenge_id")
+  challenge   Challenge         @relation(fields: [challengeId], references: [id])
+  userId      String            @map("user_id")
+  user        User              @relation(fields: [userId], references: [id])
+  status      ParticipantStatus @default(INVITED)
+  joinedAt    DateTime          @default(now()) @map("joined_at")
+  paidAt      DateTime?         @map("paid_at")
+
+  @@unique([challengeId, userId])
+  @@map("participants")
+}
+
+model Invite {
+  id          String       @id @default(uuid())
+  token       String       @unique @default(uuid())
+  targetEmail String       @map("target_email")
+  challengeId String       @map("challenge_id")
+  challenge   Challenge    @relation(fields: [challengeId], references: [id])
+  status      InviteStatus @default(PENDING)
+  expiresAt   DateTime?    @map("expires_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  acceptedAt  DateTime?    @map("accepted_at")
+
+  @@index([token])
+  @@index([targetEmail])
+  @@map("invites")
+}
+
+enum ChallengeStatus {
+  WAITING    // aguardando turma
+  ACTIVE     // no ar (Phase 2+)
+  FINISHED   // finalizado (Phase 4+)
+  CANCELLED  // cancelado (Phase 2+)
+}
+
+enum ParticipantStatus {
+  INVITED
+  PAID    // Phase 2
+  ACTIVE  // Phase 2
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
 }
 
 model RefreshToken {
