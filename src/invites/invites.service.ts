@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { IEmailProvider } from '../email/interfaces/email-provider.interface';
@@ -8,6 +8,26 @@ export interface InviteWithLink {
   token: string;
   targetEmail: string;
   copyableLink: string;
+}
+
+export interface InvitePreview {
+  targetEmail: string;
+  challenge: {
+    id: string;
+    title: string;
+    emoji: string;
+    durationDays: number;
+    collabAmount: string;
+    platformFee: string;
+    status: string;
+  };
+}
+
+export interface AcceptResult {
+  participantId: string;
+  challengeId: string;
+  status: string;
+  paidAt: Date | null;
 }
 
 @Injectable()
@@ -23,6 +43,112 @@ export class InvitesService {
     // Use FRONTEND_URL to build invite links; fall back to localhost for dev
     this.appDomain =
       this.config.get<string>('FRONTEND_URL') ?? 'http://localhost:5173';
+  }
+
+  /**
+   * Validate a PENDING invite token and return the challenge summary + targetEmail.
+   * Public endpoint — no auth required (AUTH-04 viewing is unrestricted).
+   * Throws NotFoundException for unknown or non-PENDING tokens.
+   */
+  async validate(token: string): Promise<InvitePreview> {
+    const invite = await this.prisma.invite.findUnique({
+      where: { token },
+      include: {
+        challenge: {
+          select: {
+            id: true,
+            title: true,
+            emoji: true,
+            durationDays: true,
+            collabAmount: true,
+            platformFee: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (!invite || invite.status !== 'PENDING') {
+      throw new NotFoundException('Convite inválido ou expirado.');
+    }
+
+    return {
+      targetEmail: invite.targetEmail,
+      challenge: {
+        id: invite.challenge.id,
+        title: invite.challenge.title,
+        emoji: invite.challenge.emoji,
+        durationDays: invite.challenge.durationDays,
+        collabAmount: invite.challenge.collabAmount.toString(),
+        platformFee: invite.challenge.platformFee.toString(),
+        status: invite.challenge.status,
+      },
+    };
+  }
+
+  /**
+   * Accept an invite.
+   * AUTH-05 (D-02): user.email must match invite.targetEmail (case-insensitive).
+   * If they don't match, throw ForbiddenException with both emails in the message.
+   * Creates Participant (status INVITED, paidAt null) in a $transaction with invite ACCEPTED.
+   * Does NOT set paidAt and does NOT touch challenge.status (D-11).
+   */
+  async accept(token: string, userId: string): Promise<AcceptResult> {
+    // Load the invite (must be PENDING)
+    const invite = await this.prisma.invite.findUnique({
+      where: { token },
+    });
+
+    if (!invite || invite.status !== 'PENDING') {
+      throw new NotFoundException('Convite inválido ou expirado.');
+    }
+
+    // Load the authenticated user
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('Usuário não encontrado.');
+    }
+
+    // AUTH-05 (D-02): Enforce email binding at the DATA/service layer
+    if (user.email.toLowerCase() !== invite.targetEmail.toLowerCase()) {
+      throw new ForbiddenException(
+        `Este convite é para ${invite.targetEmail}. Você está logado como ${user.email}. Entre com a conta correta para aceitar.`,
+      );
+    }
+
+    // Run accept in a $transaction: update invite + create participant (T-01-16: idempotent via @@unique)
+    const participant = await this.prisma.$transaction(async (tx) => {
+      await tx.invite.update({
+        where: { id: invite.id },
+        data: { status: 'ACCEPTED', acceptedAt: new Date() },
+      });
+
+      // @@unique([challengeId, userId]) — upsert handles the double-accept idempotently
+      const existing = await tx.participant.findUnique({
+        where: { challengeId_userId: { challengeId: invite.challengeId, userId: user.id } },
+      });
+
+      if (existing) {
+        // Already a participant — return existing (idempotent path)
+        return existing;
+      }
+
+      return tx.participant.create({
+        data: {
+          challengeId: invite.challengeId,
+          userId: user.id,
+          status: 'INVITED',
+          // paidAt intentionally null — D-11: accept does NOT mark paid
+        },
+      });
+    });
+
+    return {
+      participantId: participant.id,
+      challengeId: participant.challengeId,
+      status: participant.status,
+      paidAt: participant.paidAt,
+    };
   }
 
   /**
