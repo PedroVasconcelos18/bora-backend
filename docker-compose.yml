@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: bora-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bora
+      POSTGRES_PASSWORD: bora
+      POSTGRES_DB: bora
+    ports:
+      - "5432:5432"
+    volumes:
+      - bora-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bora -d bora"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  bora-pgdata:
