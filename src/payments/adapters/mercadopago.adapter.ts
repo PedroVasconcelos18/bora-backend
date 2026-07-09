@@ -16,11 +16,20 @@ import {
  * mock quietly. If the token is empty, construction still succeeds (so the app
  * can boot in environments where payments aren't exercised), but createPixCharge
  * throws immediately.
+ *
+ * GAP 4 (test/live observability): switching to the Mercado Pago sandbox is
+ * purely an env change — set MERCADOPAGO_ACCESS_TOKEN to a TEST- prefixed
+ * access token from an MP test application and use a test payer email; the
+ * charge body sent to the SDK is identical either way, so no other code
+ * changes are needed to exercise the QR/charge flow in sandbox.
  */
 @Injectable()
 export class MercadoPagoAdapter implements IPaymentProvider {
   private readonly logger = new Logger(MercadoPagoAdapter.name);
   private readonly payment: Payment | null;
+
+  /** Resolved from the access token prefix; never derived from or logging the token value. */
+  public readonly mode: 'test' | 'live' | 'unconfigured';
 
   constructor(private readonly config: ConfigService) {
     const accessToken = this.config.get<string>('MERCADOPAGO_ACCESS_TOKEN') ?? '';
@@ -31,9 +40,11 @@ export class MercadoPagoAdapter implements IPaymentProvider {
         options: { timeout: 5000 },
       });
       this.payment = new Payment(client);
-      this.logger.log('MercadoPagoAdapter: live mode (MERCADOPAGO_ACCESS_TOKEN present)');
+      this.mode = accessToken.startsWith('TEST-') ? 'test' : 'live';
+      this.logger.log(`MercadoPagoAdapter: ${this.mode} mode (MERCADOPAGO_ACCESS_TOKEN present)`);
     } else {
       this.payment = null;
+      this.mode = 'unconfigured';
       this.logger.warn(
         'MercadoPagoAdapter: MERCADOPAGO_ACCESS_TOKEN is empty — createPixCharge will throw (no charges can be faked)',
       );
