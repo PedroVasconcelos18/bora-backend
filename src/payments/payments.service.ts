@@ -1,6 +1,9 @@
 import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider } from './interfaces/payment-provider.interface';
+import { verifyMpSignature } from './utils/verify-signature.util';
 
 export interface CashInResult {
   qrCode: string;
@@ -8,6 +11,10 @@ export interface CashInResult {
   ticketUrl: string;
   expiresAt: Date;
   paymentId: string;
+}
+
+export interface HandleWebhookResult {
+  activated: boolean;
 }
 
 // D-08: each individual Pix cobrança (QR + copia-e-cola) expires in 30 minutes.
@@ -19,6 +26,7 @@ export class PaymentsService {
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
     @Inject('PAYMENT_PROVIDER') private readonly psp: IPaymentProvider,
   ) {}
 
@@ -87,5 +95,112 @@ export class PaymentsService {
       expiresAt: charge.expiresAt,
       paymentId: payment.id,
     };
+  }
+
+  /**
+   * Verify the Mercado Pago `x-signature` webhook header (PAY-03, D-15).
+   * Delegates to the pure HMAC util, sourcing the secret via ConfigService.
+   * `getOrThrow` means a missing MERCADOPAGO_WEBHOOK_SECRET fails loudly at
+   * call time rather than silently accepting every webhook.
+   */
+  verifySignature(xSignature: string | undefined, xRequestId: string | undefined, dataId: string): boolean {
+    const secret = this.config.getOrThrow<string>('MERCADOPAGO_WEBHOOK_SECRET');
+    return verifyMpSignature({ xSignature, xRequestId, dataId, secret });
+  }
+
+  /**
+   * Idempotent, verify-via-API webhook handler (PAY-02, D-15, T-02-07/08/11).
+   *
+   * The webhook body is NEVER trusted for state changes — `psp.getPayment`
+   * (GET /v1/payments/{id}) is called before any Prisma write. Idempotency
+   * is enforced by looking up the `Payment` row by its `@unique externalId`
+   * inside a single `$transaction`: an already-APPROVED row is a no-op
+   * (safe against MP's webhook retries / double delivery). A dataId with no
+   * matching Payment row is logged and ignored — it never fabricates a
+   * participant or payment.
+   */
+  async handleWebhook(dataId: string, rawBody: unknown): Promise<HandleWebhookResult> {
+    const confirmed = await this.psp.getPayment(dataId);
+
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.payment.findUnique({ where: { externalId: dataId } });
+
+      if (!existing) {
+        this.logger.warn(
+          `handleWebhook: no Payment row found for externalId=${dataId} — ignoring webhook`,
+        );
+        return { activated: false };
+      }
+
+      if (existing.status === 'APPROVED') {
+        // Idempotent no-op — this webhook (or a re-delivery of it) was already processed.
+        this.logger.log(
+          `handleWebhook: payment ${existing.id} (externalId=${dataId}) already APPROVED — idempotent no-op`,
+        );
+        return { activated: false };
+      }
+
+      await tx.payment.update({
+        where: { id: existing.id },
+        data: { rawWebhookPayload: (rawBody ?? {}) as Prisma.InputJsonValue },
+      });
+
+      if (confirmed.status !== 'approved') {
+        this.logger.log(
+          `handleWebhook: payment ${existing.id} (externalId=${dataId}) confirmed status=${confirmed.status} — not yet approved`,
+        );
+        return { activated: false };
+      }
+
+      await tx.payment.update({
+        where: { id: existing.id },
+        data: { status: 'APPROVED', paidAt: new Date() },
+      });
+
+      await tx.participant.update({
+        where: { id: existing.participantId },
+        data: { status: 'PAID', paidAt: new Date() },
+      });
+
+      const activated = await this.tryActivateChallenge(tx, existing.challengeId);
+
+      this.logger.log(
+        `handleWebhook: participant ${existing.participantId} marked PAID (payment ${existing.id})${
+          activated ? ' — challenge activated' : ''
+        }`,
+      );
+
+      return { activated };
+    });
+  }
+
+  /**
+   * Atomic conditional challenge activation (CHAL-06, D-04, pitfall S2).
+   *
+   * A single `$executeRaw` `UPDATE ... WHERE status = 'WAITING' AND (paid
+   * count) >= 3` — never a read-then-write. Two concurrent payments racing
+   * this serialize on the row's implicit lock; only one call observes
+   * `status = 'WAITING'` still true and performs the transition, so the
+   * returned boolean tells the caller whether THIS call was the one that
+   * activated the challenge (useful for firing "challenge started" side
+   * effects exactly once).
+   */
+  async tryActivateChallenge(tx: Prisma.TransactionClient, challengeId: string): Promise<boolean> {
+    const rowsChanged = await tx.$executeRaw`
+      UPDATE challenges
+      SET status = 'ACTIVE', starts_at = NOW()
+      WHERE id = ${challengeId}
+        AND status = 'WAITING'
+        AND (
+          SELECT COUNT(*) FROM participants
+          WHERE challenge_id = ${challengeId} AND status = 'PAID'
+        ) >= 3
+    `;
+
+    if (rowsChanged === 1) {
+      this.logger.log(`tryActivateChallenge: challenge ${challengeId} transitioned WAITING -> ACTIVE`);
+    }
+
+    return rowsChanged === 1;
   }
 }

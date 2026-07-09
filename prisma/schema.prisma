@@ -39,6 +39,7 @@ model Challenge {
   invites       Invite[]
   payments      Payment[]
   createdAt     DateTime        @default(now()) @map("created_at")
+  startsAt      DateTime?       @map("starts_at")
 
   @@map("challenges")
 }
