@@ -1,5 +1,5 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHmac } from 'crypto';
 import { PaymentsService } from './payments.service';
@@ -145,6 +145,23 @@ describe('PaymentsService', () => {
 
       await expect(service.createCashIn('participant-1')).rejects.toThrow(BadRequestException);
       expect(psp.createPixCharge).not.toHaveBeenCalled();
+    });
+
+    it('maps a psp.createPixCharge failure to a friendly ServiceUnavailableException instead of leaking a raw 500 (GAP 3)', async () => {
+      psp.createPixCharge.mockRejectedValueOnce(new Error('Unauthorized use of live credentials'));
+
+      let caught: unknown;
+      try {
+        await service.createCashIn('participant-1');
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(ServiceUnavailableException);
+      expect((caught as ServiceUnavailableException).message).toBe(
+        'Não foi possível gerar a cobrança Pix agora. Tente novamente.',
+      );
+      expect(prisma.payment.create).not.toHaveBeenCalled();
     });
   });
 
