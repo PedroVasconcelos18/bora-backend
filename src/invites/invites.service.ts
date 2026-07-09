@@ -2,6 +2,7 @@ import { ForbiddenException, Inject, Injectable, Logger, NotFoundException } fro
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { IEmailProvider } from '../email/interfaces/email-provider.interface';
+import { PaymentsService, CashInResult } from '../payments/payments.service';
 
 export interface InviteWithLink {
   inviteId: string;
@@ -30,6 +31,11 @@ export interface AcceptResult {
   paidAt: Date | null;
 }
 
+export interface AcceptAndPayResult extends CashInResult {
+  participantId: string;
+  challengeId: string;
+}
+
 @Injectable()
 export class InvitesService {
   private readonly logger = new Logger(InvitesService.name);
@@ -39,6 +45,7 @@ export class InvitesService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     @Inject('EMAIL_PROVIDER') private readonly emailProvider: IEmailProvider,
+    private readonly paymentsService: PaymentsService,
   ) {
     // Use FRONTEND_URL to build invite links; fall back to localhost for dev
     this.appDomain =
@@ -148,6 +155,28 @@ export class InvitesService {
       challengeId: participant.challengeId,
       status: participant.status,
       paidAt: participant.paidAt,
+    };
+  }
+
+  /**
+   * Accept an invite and immediately create the Pix charge in one flow (D-06).
+   * Runs the existing accept() transaction first to guarantee the Participant
+   * exists (idempotent on double-accept), then delegates to
+   * PaymentsService.createCashIn — the same charge path the creator's
+   * "pagar minha entrada" endpoint uses.
+   */
+  async acceptAndPay(
+    token: string,
+    userId: string,
+    pixKey?: string,
+  ): Promise<AcceptAndPayResult> {
+    const accepted = await this.accept(token, userId);
+    const cashIn = await this.paymentsService.createCashIn(accepted.participantId, pixKey);
+
+    return {
+      ...cashIn,
+      participantId: accepted.participantId,
+      challengeId: accepted.challengeId,
     };
   }
 

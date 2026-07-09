@@ -1,8 +1,9 @@
-import { Controller, Get, HttpCode, Param, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserPayload } from '../auth/strategies/jwt.strategy';
 import { InvitesService } from './invites.service';
+import { AcceptAndPayDto } from './dto/accept-and-pay.dto';
 
 @Controller('invites')
 export class InvitesController {
@@ -32,5 +33,22 @@ export class InvitesController {
     @CurrentUser() currentUser: UserPayload,
   ) {
     return this.invitesService.accept(token, currentUser.id);
+  }
+
+  /**
+   * POST /invites/:token/accept-and-pay
+   * Protected — JwtAuthGuard required.
+   * Accepts the invite (same email-binding rule as /accept, AUTH-05) then
+   * immediately creates a Pix charge for the new Participant (D-06).
+   */
+  @Post(':token/accept-and-pay')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(201)
+  async acceptAndPay(
+    @Param('token') token: string,
+    @Body() dto: AcceptAndPayDto,
+    @CurrentUser() currentUser: UserPayload,
+  ) {
+    return this.invitesService.acceptAndPay(token, currentUser.id, dto.pixKey);
   }
 }
