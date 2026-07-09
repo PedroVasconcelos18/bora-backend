@@ -38,6 +38,7 @@ model Challenge {
   participants  Participant[]
   invites       Invite[]
   payments      Payment[]
+  evidences     Evidence[]
   createdAt     DateTime        @default(now()) @map("created_at")
   startsAt      DateTime?       @map("starts_at")
 
@@ -55,6 +56,8 @@ model Participant {
   paidAt      DateTime?         @map("paid_at")
   pixKey      String?           @map("pix_key")
   payments    Payment[]
+  evidences   Evidence[]
+  votes       Vote[]
 
   @@unique([challengeId, userId])
   @@map("participants")
@@ -119,6 +122,49 @@ enum PaymentStatus {
   CANCELLED
   REFUND_PENDING
   REFUNDED
+}
+
+model Evidence {
+  id                String        @id @default(uuid())
+  challengeId       String        @map("challenge_id")
+  challenge         Challenge     @relation(fields: [challengeId], references: [id])
+  participantId     String        @map("participant_id")
+  participant       Participant   @relation(fields: [participantId], references: [id])
+  objectKey         String        @map("object_key")
+  evidenceDate      String        @map("evidence_date")
+  status            EvidenceStatus @default(PENDING)
+  windowClosesAt    DateTime      @map("window_closes_at")
+  postedAt          DateTime      @default(now()) @map("posted_at")
+  resolvedAt        DateTime?     @map("resolved_at")
+  votes             Vote[]
+
+  @@unique([participantId, evidenceDate])
+  @@index([status, windowClosesAt])
+  @@map("evidences")
+}
+
+enum EvidenceStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+model Vote {
+  id            String      @id @default(uuid())
+  evidenceId    String      @map("evidence_id")
+  evidence      Evidence    @relation(fields: [evidenceId], references: [id])
+  voterId       String      @map("voter_id")
+  voter         Participant @relation(fields: [voterId], references: [id])
+  value         VoteValue
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  @@unique([evidenceId, voterId])
+  @@map("votes")
+}
+
+enum VoteValue {
+  SIM
+  NAO
 }
 
 model RefreshToken {
