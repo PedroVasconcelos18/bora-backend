@@ -17,6 +17,10 @@ export interface HandleWebhookResult {
   activated: boolean;
 }
 
+export interface DeadlineResult {
+  action: 'none' | 'activated' | 'cancelled';
+}
+
 // D-08: each individual Pix cobrança (QR + copia-e-cola) expires in 30 minutes.
 const PIX_EXPIRATION_MINUTES = 30;
 
@@ -235,5 +239,60 @@ export class PaymentsService {
     this.logger.log(
       `cancelChallenge: challenge ${challengeId} CANCELLED (reason=${reason}); pending invites EXPIRED; approved payments -> REFUND_PENDING`,
     );
+  }
+
+  /**
+   * Resolve an expired WAITING challenge at its 3-day payment deadline
+   * (D-02/D-07/D-09, PAY-08 auto path, CHAL-06 deadline path).
+   *
+   * Idempotent: if the challenge is no longer WAITING (already ACTIVE,
+   * CANCELLED, or FINISHED), this is a no-op — safe to call twice for the
+   * same challenge (e.g. a slow cron run overlapping the next tick).
+   *
+   * >= 3 paid participants: reuses the exact same atomic conditional UPDATE
+   * as the webhook path (tryActivateChallenge) — no separate activation
+   * logic to drift out of sync (pitfall S2).
+   * < 3 paid participants: funnels through cancelChallenge('deadline') —
+   * the same single-$transaction CANCELLED + EXPIRED invites + REFUND_PENDING
+   * chain the creator's manual cancel endpoint uses (D-09/D-10/D-12).
+   */
+  async processDeadline(challengeId: string): Promise<DeadlineResult> {
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      const challenge = await tx.challenge.findUnique({ where: { id: challengeId } });
+
+      if (!challenge) {
+        throw new NotFoundException('Desafio não encontrado.');
+      }
+
+      if (challenge.status !== 'WAITING') {
+        // Idempotent no-op — already resolved by a prior run or the webhook path.
+        return { action: 'none' as const };
+      }
+
+      const paidCount = await tx.participant.count({
+        where: { challengeId, status: 'PAID' },
+      });
+
+      if (paidCount >= 3) {
+        const activated = await this.tryActivateChallenge(tx, challengeId);
+        return { action: (activated ? 'activated' : 'none') as 'activated' | 'none' };
+      }
+
+      return { action: 'cancel' as const };
+    });
+
+    if (outcome.action === 'cancel') {
+      await this.cancelChallenge(challengeId, 'deadline');
+      this.logger.log(
+        `processDeadline: challenge ${challengeId} <3 paid at deadline — cancelled into refund queue`,
+      );
+      return { action: 'cancelled' };
+    }
+
+    if (outcome.action === 'activated') {
+      this.logger.log(`processDeadline: challenge ${challengeId} >=3 paid at deadline — activated`);
+    }
+
+    return outcome;
   }
 }

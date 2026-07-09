@@ -1,5 +1,5 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHmac } from 'crypto';
 import { PaymentsService } from './payments.service';
@@ -13,8 +13,8 @@ describe('PaymentsService', () => {
   let config: { getOrThrow: jest.Mock };
   let tx: {
     payment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
-    participant: { update: jest.Mock };
-    challenge: { update: jest.Mock };
+    participant: { update: jest.Mock; count: jest.Mock };
+    challenge: { update: jest.Mock; findUnique: jest.Mock };
     invite: { updateMany: jest.Mock };
     $executeRaw: jest.Mock;
   };
@@ -67,9 +67,11 @@ describe('PaymentsService', () => {
       },
       participant: {
         update: jest.fn(),
+        count: jest.fn(),
       },
       challenge: {
         update: jest.fn(),
+        findUnique: jest.fn(),
       },
       invite: {
         updateMany: jest.fn(),
@@ -303,6 +305,73 @@ describe('PaymentsService', () => {
         where: { challengeId: 'challenge-1', status: 'APPROVED' },
         data: { status: 'REFUND_PENDING' },
       });
+    });
+  });
+
+  describe('processDeadline', () => {
+    it('is a no-op when the challenge is not WAITING (idempotent second run)', async () => {
+      tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'ACTIVE' });
+
+      const result = await service.processDeadline('challenge-1');
+
+      expect(result).toEqual({ action: 'none' });
+      expect(tx.participant.count).not.toHaveBeenCalled();
+      expect(tx.$executeRaw).not.toHaveBeenCalled();
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws NotFoundException when the challenge does not exist', async () => {
+      tx.challenge.findUnique.mockResolvedValue(null);
+
+      await expect(service.processDeadline('missing-challenge')).rejects.toThrow(NotFoundException);
+    });
+
+    it('activates via the same atomic conditional UPDATE when >=3 paid (reuses tryActivateChallenge)', async () => {
+      tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'WAITING' });
+      tx.participant.count.mockResolvedValue(3);
+      tx.$executeRaw.mockResolvedValue(1);
+
+      const result = await service.processDeadline('challenge-1');
+
+      expect(result).toEqual({ action: 'activated' });
+      expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels into the refund queue when <3 paid at the deadline', async () => {
+      tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'WAITING' });
+      tx.participant.count.mockResolvedValue(2);
+
+      const result = await service.processDeadline('challenge-1');
+
+      expect(result).toEqual({ action: 'cancelled' });
+      // cancelChallenge runs its own top-level $transaction — the deadline
+      // check ran in the first $transaction, cancelChallenge in a second.
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      expect(tx.challenge.update).toHaveBeenCalledWith({
+        where: { id: 'challenge-1' },
+        data: { status: 'CANCELLED' },
+      });
+      expect(tx.payment.updateMany).toHaveBeenCalledWith({
+        where: { challengeId: 'challenge-1', status: 'APPROVED' },
+        data: { status: 'REFUND_PENDING' },
+      });
+    });
+
+    it('running processDeadline twice on the same challenge produces the same terminal result (idempotent)', async () => {
+      tx.challenge.findUnique.mockResolvedValueOnce({ id: 'challenge-1', status: 'WAITING' });
+      tx.participant.count.mockResolvedValue(2);
+
+      const first = await service.processDeadline('challenge-1');
+      expect(first).toEqual({ action: 'cancelled' });
+
+      // Second run: challenge is now CANCELLED — no-op.
+      tx.challenge.findUnique.mockResolvedValueOnce({ id: 'challenge-1', status: 'CANCELLED' });
+      const second = await service.processDeadline('challenge-1');
+
+      expect(second).toEqual({ action: 'none' });
+      // No additional cancellation side effects on the second, idempotent run.
+      expect(tx.challenge.update).toHaveBeenCalledTimes(1);
+      expect(tx.payment.updateMany).toHaveBeenCalledTimes(1);
     });
   });
 });
