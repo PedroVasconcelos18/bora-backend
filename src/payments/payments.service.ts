@@ -203,4 +203,37 @@ export class PaymentsService {
 
     return rowsChanged === 1;
   }
+
+  /**
+   * Cancellation → refund queue → invite expiry, chained atomically (D-09/D-10/D-12).
+   *
+   * In a single `$transaction`: flips the challenge to CANCELLED, expires its
+   * pending invites (D-12 — forwarded/old links stop working), and moves any
+   * already-APPROVED payment for the challenge to REFUND_PENDING — that row
+   * set IS the manual refund queue an admin works from (D-10). Callers
+   * (creator cancel endpoint, and later the deadline-sweep cron) both funnel
+   * through this single method so the three consequences never drift apart.
+   */
+  async cancelChallenge(challengeId: string, reason: 'manual' | 'deadline'): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.challenge.update({
+        where: { id: challengeId },
+        data: { status: 'CANCELLED' },
+      });
+
+      await tx.invite.updateMany({
+        where: { challengeId, status: 'PENDING' },
+        data: { status: 'EXPIRED' },
+      });
+
+      await tx.payment.updateMany({
+        where: { challengeId, status: 'APPROVED' },
+        data: { status: 'REFUND_PENDING' },
+      });
+    });
+
+    this.logger.log(
+      `cancelChallenge: challenge ${challengeId} CANCELLED (reason=${reason}); pending invites EXPIRED; approved payments -> REFUND_PENDING`,
+    );
+  }
 }

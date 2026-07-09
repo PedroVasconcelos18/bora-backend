@@ -13,6 +13,23 @@ export interface PaymentStatusResult {
   challengeStatus: string;
 }
 
+export interface WaitingRoomParticipant {
+  name: string;
+  paid: boolean;
+}
+
+export interface WaitingRoomStatusResult {
+  status: string;
+  deadline: Date;
+  paidCount: number;
+  totalCount: number;
+  prize: string;
+  participants: WaitingRoomParticipant[];
+}
+
+// D-07: challenge payment window is 3 days from creation.
+const PAYMENT_WINDOW_DAYS = 3;
+
 @Injectable()
 export class ParticipantsService {
   private readonly logger = new Logger(ParticipantsService.name);
@@ -82,6 +99,56 @@ export class ParticipantsService {
       participantStatus: participant.status,
       paymentStatus: latestPayment?.status ?? null,
       challengeStatus: participant.challenge.status,
+    };
+  }
+
+  /**
+   * Waiting-room nominal list (CHAL-05, D-13): who paid and who is still
+   * pending, visible to ALL participants — this is the social-pressure
+   * engine, not a discreet count. Also returns the live "N de M pagaram"
+   * figures, the 3-day deadline (D-07), and the prize.
+   *
+   * D-03 / pitfall M4: the prize is derived from the CURRENT paid count on
+   * every read — never a cached column — so it can never drift from the
+   * actual paid state. Clamped at 0 so a fresh challenge with zero paid
+   * participants never displays a negative prize.
+   */
+  async getWaitingRoomStatus(challengeId: string): Promise<WaitingRoomStatusResult> {
+    const challenge = await this.prisma.challenge.findUnique({
+      where: { id: challengeId },
+      include: {
+        participants: {
+          include: { user: { select: { name: true } } },
+          orderBy: { paidAt: { sort: 'asc', nulls: 'last' } },
+        },
+      },
+    });
+
+    if (!challenge) {
+      throw new NotFoundException('Desafio não encontrado.');
+    }
+
+    const paidCount = challenge.participants.filter((p) => p.status === 'PAID').length;
+    const totalCount = challenge.participants.length;
+
+    const collabAmount = Number(challenge.collabAmount);
+    const platformFee = Number(challenge.platformFee);
+    const prizeValue = Math.max(0, collabAmount * paidCount - platformFee);
+
+    const deadline = new Date(
+      challenge.createdAt.getTime() + PAYMENT_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    );
+
+    return {
+      status: challenge.status,
+      deadline,
+      paidCount,
+      totalCount,
+      prize: prizeValue.toFixed(2),
+      participants: challenge.participants.map((p) => ({
+        name: p.user.name,
+        paid: p.status === 'PAID',
+      })),
     };
   }
 }

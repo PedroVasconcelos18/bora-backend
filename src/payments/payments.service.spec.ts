@@ -12,8 +12,10 @@ describe('PaymentsService', () => {
   let psp: jest.Mocked<IPaymentProvider>;
   let config: { getOrThrow: jest.Mock };
   let tx: {
-    payment: { findUnique: jest.Mock; update: jest.Mock };
+    payment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     participant: { update: jest.Mock };
+    challenge: { update: jest.Mock };
+    invite: { updateMany: jest.Mock };
     $executeRaw: jest.Mock;
   };
   let prisma: {
@@ -61,9 +63,16 @@ describe('PaymentsService', () => {
       payment: {
         findUnique: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn(),
       },
       participant: {
         update: jest.fn(),
+      },
+      challenge: {
+        update: jest.fn(),
+      },
+      invite: {
+        updateMany: jest.fn(),
       },
       $executeRaw: jest.fn().mockResolvedValue(0),
     };
@@ -274,6 +283,26 @@ describe('PaymentsService', () => {
       );
 
       expect(result).toBe(false);
+    });
+  });
+
+  describe('cancelChallenge', () => {
+    it('sets the challenge CANCELLED, pending invites EXPIRED, and APPROVED payments REFUND_PENDING in a single $transaction (D-09/D-10/D-12)', async () => {
+      await service.cancelChallenge('challenge-1', 'manual');
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(tx.challenge.update).toHaveBeenCalledWith({
+        where: { id: 'challenge-1' },
+        data: { status: 'CANCELLED' },
+      });
+      expect(tx.invite.updateMany).toHaveBeenCalledWith({
+        where: { challengeId: 'challenge-1', status: 'PENDING' },
+        data: { status: 'EXPIRED' },
+      });
+      expect(tx.payment.updateMany).toHaveBeenCalledWith({
+        where: { challengeId: 'challenge-1', status: 'APPROVED' },
+        data: { status: 'REFUND_PENDING' },
+      });
     });
   });
 });

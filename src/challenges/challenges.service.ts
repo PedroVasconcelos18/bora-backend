@@ -1,6 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { InvitesService, InviteWithLink } from '../invites/invites.service';
+import { PaymentsService } from '../payments/payments.service';
 import { CreateChallengeDto } from './dto/create-challenge.dto';
 
 export interface ChallengeWithLinks {
@@ -23,6 +30,7 @@ export class ChallengesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly invitesService: InvitesService,
+    private readonly paymentsService: PaymentsService,
   ) {}
 
   /**
@@ -145,5 +153,37 @@ export class ChallengesService {
       collabAmount: challenge.collabAmount.toString(),
       platformFee: challenge.platformFee.toString(),
     };
+  }
+
+  /**
+   * Creator-initiated cancellation (PAY-08 manual path, D-09).
+   * Guards: caller must be the challenge's creator (T-02-12) and the
+   * challenge must still be WAITING — once ACTIVE, participation is a
+   * commitment and there is no cancellation (T-02-13, no refund after start).
+   * Delegates the actual state transition + refund-queue enqueue to
+   * PaymentsService.cancelChallenge (D-09/D-10/D-12, single $transaction).
+   */
+  async cancel(challengeId: string, callerId: string): Promise<{ status: string }> {
+    const challenge = await this.prisma.challenge.findUnique({
+      where: { id: challengeId },
+    });
+
+    if (!challenge) {
+      throw new NotFoundException('Desafio não encontrado.');
+    }
+
+    if (challenge.creatorId !== callerId) {
+      throw new ForbiddenException('Apenas o criador pode cancelar o desafio.');
+    }
+
+    if (challenge.status !== 'WAITING') {
+      throw new ConflictException(
+        'Só é possível cancelar um desafio enquanto ele está aguardando turma.',
+      );
+    }
+
+    await this.paymentsService.cancelChallenge(challengeId, 'manual');
+
+    return { status: 'CANCELLED' };
   }
 }
