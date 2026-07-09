@@ -1,8 +1,15 @@
-import { BadRequestException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service';
-import { IPaymentProvider } from './interfaces/payment-provider.interface';
+import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
 import { verifyMpSignature } from './utils/verify-signature.util';
 
 export interface CashInResult {
@@ -69,14 +76,28 @@ export class PaymentsService {
     // D-15: always send an idempotency key on charge creation.
     const idempotencyKey = `${participantId}-${Date.now()}`;
 
-    const charge = await this.psp.createPixCharge({
-      amount: Number(participant.challenge.collabAmount),
-      description: `Entrada — ${participant.challenge.title}`,
-      payerEmail: participant.user.email,
-      externalReference: participantId,
-      expirationMinutes: PIX_EXPIRATION_MINUTES,
-      idempotencyKey,
-    });
+    let charge: PixChargeResult;
+    try {
+      charge = await this.psp.createPixCharge({
+        amount: Number(participant.challenge.collabAmount),
+        description: `Entrada — ${participant.challenge.title}`,
+        payerEmail: participant.user.email,
+        externalReference: participantId,
+        expirationMinutes: PIX_EXPIRATION_MINUTES,
+        idempotencyKey,
+      });
+    } catch (err) {
+      // GAP 3 / T-02-G3: MP internals (401/400 bodies, stack) never leave the
+      // process — the client only ever sees a generic pt-BR 503.
+      this.logger.error(
+        `createCashIn: psp.createPixCharge failed for participant ${participantId}: ${
+          err instanceof Error ? err.stack ?? err.message : String(err)
+        }`,
+      );
+      throw new ServiceUnavailableException(
+        'Não foi possível gerar a cobrança Pix agora. Tente novamente.',
+      );
+    }
 
     const payment = await this.prisma.payment.create({
       data: {
