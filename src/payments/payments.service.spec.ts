@@ -1,6 +1,7 @@
 import { Test } from '@nestjs/testing';
 import { BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHmac } from 'crypto';
 import { PaymentsService } from './payments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
@@ -9,9 +10,16 @@ import { MercadoPagoAdapter } from './adapters/mercadopago.adapter';
 describe('PaymentsService', () => {
   let service: PaymentsService;
   let psp: jest.Mocked<IPaymentProvider>;
+  let config: { getOrThrow: jest.Mock };
+  let tx: {
+    payment: { findUnique: jest.Mock; update: jest.Mock };
+    participant: { update: jest.Mock };
+    $executeRaw: jest.Mock;
+  };
   let prisma: {
     participant: { findUnique: jest.Mock; update: jest.Mock };
     payment: { create: jest.Mock };
+    $transaction: jest.Mock;
   };
 
   const chargeResult: PixChargeResult = {
@@ -37,10 +45,27 @@ describe('PaymentsService', () => {
     user: { id: 'user-1', email: 'joao@example.com', name: 'João' },
   };
 
+  const webhookSecret = 'test-webhook-secret-fixture';
+
   beforeEach(async () => {
     psp = {
       createPixCharge: jest.fn().mockResolvedValue(chargeResult),
       getPayment: jest.fn(),
+    };
+
+    config = {
+      getOrThrow: jest.fn().mockReturnValue(webhookSecret),
+    };
+
+    tx = {
+      payment: {
+        findUnique: jest.fn(),
+        update: jest.fn(),
+      },
+      participant: {
+        update: jest.fn(),
+      },
+      $executeRaw: jest.fn().mockResolvedValue(0),
     };
 
     prisma = {
@@ -58,12 +83,14 @@ describe('PaymentsService', () => {
           status: 'PENDING',
         }),
       },
+      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(tx)),
     };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         PaymentsService,
         { provide: PrismaService, useValue: prisma },
+        { provide: ConfigService, useValue: config },
         { provide: 'PAYMENT_PROVIDER', useValue: psp },
       ],
     }).compile();
@@ -71,47 +98,49 @@ describe('PaymentsService', () => {
     service = moduleRef.get(PaymentsService);
   });
 
-  it('calls the injected provider and returns the QR result for a WAITING participant', async () => {
-    const result = await service.createCashIn('participant-1');
+  describe('createCashIn', () => {
+    it('calls the injected provider and returns the QR result for a WAITING participant', async () => {
+      const result = await service.createCashIn('participant-1');
 
-    expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
-    expect(result).toEqual({
-      qrCode: chargeResult.qrCode,
-      qrCodeBase64: chargeResult.qrCodeBase64,
-      ticketUrl: chargeResult.ticketUrl,
-      expiresAt: chargeResult.expiresAt,
-      paymentId: 'payment-1',
-    });
-  });
-
-  it('persists a PENDING Payment row with the returned externalId, amount, participantId, and challengeId', async () => {
-    await service.createCashIn('participant-1');
-
-    expect(prisma.payment.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        externalId: chargeResult.externalId,
-        participantId: waitingParticipant.id,
-        challengeId: waitingParticipant.challengeId,
-        amount: waitingParticipant.challenge.collabAmount,
-        status: 'PENDING',
-      }),
-    });
-  });
-
-  it('throws when the participant challenge is not WAITING (pitfall M4)', async () => {
-    prisma.participant.findUnique.mockResolvedValueOnce({
-      ...waitingParticipant,
-      challenge: { ...waitingParticipant.challenge, status: 'ACTIVE' },
+      expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({
+        qrCode: chargeResult.qrCode,
+        qrCodeBase64: chargeResult.qrCodeBase64,
+        ticketUrl: chargeResult.ticketUrl,
+        expiresAt: chargeResult.expiresAt,
+        paymentId: 'payment-1',
+      });
     });
 
-    await expect(service.createCashIn('participant-1')).rejects.toThrow(BadRequestException);
-    expect(psp.createPixCharge).not.toHaveBeenCalled();
+    it('persists a PENDING Payment row with the returned externalId, amount, participantId, and challengeId', async () => {
+      await service.createCashIn('participant-1');
+
+      expect(prisma.payment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          externalId: chargeResult.externalId,
+          participantId: waitingParticipant.id,
+          challengeId: waitingParticipant.challengeId,
+          amount: waitingParticipant.challenge.collabAmount,
+          status: 'PENDING',
+        }),
+      });
+    });
+
+    it('throws when the participant challenge is not WAITING (pitfall M4)', async () => {
+      prisma.participant.findUnique.mockResolvedValueOnce({
+        ...waitingParticipant,
+        challenge: { ...waitingParticipant.challenge, status: 'ACTIVE' },
+      });
+
+      await expect(service.createCashIn('participant-1')).rejects.toThrow(BadRequestException);
+      expect(psp.createPixCharge).not.toHaveBeenCalled();
+    });
   });
 
   describe('MercadoPagoAdapter without MERCADOPAGO_ACCESS_TOKEN', () => {
     it('throws on createPixCharge rather than faking a QR', async () => {
-      const config = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
-      const adapter = new MercadoPagoAdapter(config);
+      const adapterConfig = { get: jest.fn().mockReturnValue(undefined) } as unknown as ConfigService;
+      const adapter = new MercadoPagoAdapter(adapterConfig);
 
       await expect(
         adapter.createPixCharge({
@@ -123,6 +152,128 @@ describe('PaymentsService', () => {
           idempotencyKey: 'participant-1-123',
         }),
       ).rejects.toThrow('MERCADOPAGO_ACCESS_TOKEN');
+    });
+  });
+
+  describe('verifySignature', () => {
+    it('delegates to the HMAC util using MERCADOPAGO_WEBHOOK_SECRET from ConfigService', () => {
+      const dataId = 'mp-external-id-123';
+      const ts = '1704908010';
+      const xRequestId = 'req-1';
+      const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
+      const v1 = createHmac('sha256', webhookSecret).update(manifest).digest('hex');
+      const xSignature = `ts=${ts},v1=${v1}`;
+
+      expect(service.verifySignature(xSignature, xRequestId, dataId)).toBe(true);
+      expect(config.getOrThrow).toHaveBeenCalledWith('MERCADOPAGO_WEBHOOK_SECRET');
+    });
+
+    it('returns false for a tampered signature', () => {
+      expect(service.verifySignature('ts=1,v1=deadbeef', 'req-1', 'mp-external-id-123')).toBe(false);
+    });
+  });
+
+  describe('handleWebhook', () => {
+    const existingPayment = {
+      id: 'payment-1',
+      externalId: 'mp-external-id-123',
+      participantId: 'participant-1',
+      challengeId: 'challenge-1',
+      status: 'PENDING',
+    };
+
+    it('marks the matching Payment APPROVED and the Participant PAID + paidAt when GET /v1/payments status is approved', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+
+      await service.handleWebhook('mp-external-id-123', { type: 'payment', data: { id: 'mp-external-id-123' } });
+
+      expect(psp.getPayment).toHaveBeenCalledWith('mp-external-id-123');
+      expect(tx.payment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'payment-1' },
+          data: expect.objectContaining({ status: 'APPROVED', paidAt: expect.any(Date) }),
+        }),
+      );
+      expect(tx.participant.update).toHaveBeenCalledWith({
+        where: { id: 'participant-1' },
+        data: { status: 'PAID', paidAt: expect.any(Date) },
+      });
+    });
+
+    it('calls psp.getPayment (verify-via-API) before any Prisma write', async () => {
+      const callOrder: string[] = [];
+      psp.getPayment.mockImplementation(async () => {
+        callOrder.push('getPayment');
+        return { status: 'approved', externalReference: 'participant-1' };
+      });
+      prisma.$transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+        callOrder.push('$transaction');
+        return callback(tx);
+      });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(callOrder).toEqual(['getPayment', '$transaction']);
+    });
+
+    it('is idempotent: called twice with the same approved dataId leaves exactly one PAID transition (second call is a no-op)', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+
+      tx.payment.findUnique.mockResolvedValueOnce(existingPayment);
+      await service.handleWebhook('mp-external-id-123', {});
+
+      tx.payment.findUnique.mockResolvedValueOnce({ ...existingPayment, status: 'APPROVED' });
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(tx.participant.update).toHaveBeenCalledTimes(1);
+      expect(tx.payment.update).toHaveBeenCalledTimes(2); // 1 rawWebhookPayload write + 1 APPROVED write, from the FIRST call only
+    });
+
+    it('logs and does not throw or create a participant when no matching Payment row exists', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'unknown-id' });
+      tx.payment.findUnique.mockResolvedValue(null);
+
+      await expect(service.handleWebhook('unknown-external-id', {})).resolves.toEqual({ activated: false });
+
+      expect(tx.participant.update).not.toHaveBeenCalled();
+      expect(tx.payment.update).not.toHaveBeenCalled();
+    });
+
+    it('returns activated: true when tryActivateChallenge performs the transition', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+      tx.$executeRaw.mockResolvedValue(1);
+
+      const result = await service.handleWebhook('mp-external-id-123', {});
+
+      expect(result).toEqual({ activated: true });
+    });
+  });
+
+  describe('tryActivateChallenge', () => {
+    it('returns true exactly once when the atomic UPDATE reports exactly one row changed', async () => {
+      tx.$executeRaw.mockResolvedValue(1);
+
+      const result = await service.tryActivateChallenge(
+        tx as unknown as Parameters<typeof service.tryActivateChallenge>[0],
+        'challenge-1',
+      );
+
+      expect(result).toBe(true);
+      expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns false when the atomic UPDATE affects zero rows (not enough paid, or already activated)', async () => {
+      tx.$executeRaw.mockResolvedValue(0);
+
+      const result = await service.tryActivateChallenge(
+        tx as unknown as Parameters<typeof service.tryActivateChallenge>[0],
+        'challenge-1',
+      );
+
+      expect(result).toBe(false);
     });
   });
 });
