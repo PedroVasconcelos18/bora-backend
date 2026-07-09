@@ -37,6 +37,7 @@ model Challenge {
   creator       User            @relation("CreatedChallenges", fields: [creatorId], references: [id])
   participants  Participant[]
   invites       Invite[]
+  payments      Payment[]
   createdAt     DateTime        @default(now()) @map("created_at")
 
   @@map("challenges")
@@ -51,6 +52,8 @@ model Participant {
   status      ParticipantStatus @default(INVITED)
   joinedAt    DateTime          @default(now()) @map("joined_at")
   paidAt      DateTime?         @map("paid_at")
+  pixKey      String?           @map("pix_key")
+  payments    Payment[]
 
   @@unique([challengeId, userId])
   @@map("participants")
@@ -89,6 +92,32 @@ enum InviteStatus {
   PENDING
   ACCEPTED
   EXPIRED
+}
+
+model Payment {
+  id                String        @id @default(uuid())
+  externalId        String?       @unique @map("external_id")
+  participantId     String        @map("participant_id")
+  participant       Participant   @relation(fields: [participantId], references: [id])
+  challengeId       String        @map("challenge_id")
+  challenge         Challenge     @relation(fields: [challengeId], references: [id])
+  amount            Decimal       @db.Decimal(10, 2)
+  status            PaymentStatus @default(PENDING)
+  rawWebhookPayload Json?         @map("raw_webhook_payload")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  paidAt            DateTime?     @map("paid_at")
+  refundedAt        DateTime?     @map("refunded_at")
+
+  @@index([status])
+  @@map("payments")
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
 }
 
 model RefreshToken {
