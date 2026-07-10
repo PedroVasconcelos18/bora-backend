@@ -129,6 +129,9 @@ export class RankingService {
     }
     const leaders = participants.filter((p) => p.isLeader).map((p) => p.name);
 
+    // RANK-01: participants ordered by validatedDays desc.
+    participants.sort((a, b) => b.validatedDays - a.validatedDays);
+
     return { prize: prizeValue.toFixed(2), leaders, participants };
   }
 }

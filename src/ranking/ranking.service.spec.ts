@@ -57,6 +57,31 @@ describe('RankingService (RANK-01/02/03/04)', () => {
     expect(result.participants.find((p) => p.id === 'p2')?.validatedDays).toBe(0);
   });
 
+  it('orders participants by validatedDays desc (RANK-01), independent of the input order', async () => {
+    const startsAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+
+    prisma.challenge.findUnique.mockResolvedValueOnce({
+      id: challengeId,
+      durationDays: 5,
+      collabAmount: 20,
+      platformFee: 10,
+      startsAt,
+      createdAt: startsAt,
+      participants: [
+        { id: 'p1', user: { name: 'Ana' }, evidences: [] }, // lower count, listed first
+        { id: 'p2', user: { name: 'Beto' }, evidences: [] }, // higher count, listed second
+      ],
+    });
+    prisma.evidence.groupBy.mockResolvedValueOnce([
+      { participantId: 'p1', _count: 1 },
+      { participantId: 'p2', _count: 4 },
+    ]);
+
+    const result = await service.getRanking(challengeId);
+
+    expect(result.participants.map((p) => p.id)).toEqual(['p2', 'p1']);
+  });
+
   it('flags BOTH participants as leaders on a two-way tie at the max validatedDays (RANK-04)', async () => {
     const startsAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
 
