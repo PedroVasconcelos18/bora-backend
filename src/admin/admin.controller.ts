@@ -31,4 +31,24 @@ export class AdminController {
   async markRefunded(@Param('id') id: string) {
     return this.adminService.markRefunded(id);
   }
+
+  /**
+   * GET /admin/payouts — the manual cash-out queue (PAY-07): winner name,
+   * prize amount, and the snapshotted Pix key for every PAYOUT_PENDING
+   * payment.
+   */
+  @Get('payouts')
+  async listPayouts() {
+    return this.adminService.listPayouts();
+  }
+
+  /**
+   * PATCH /admin/payouts/:id — mark a payout done: PAID_OUT + paidAt +
+   * logged.
+   */
+  @Patch('payouts/:id')
+  @HttpCode(200)
+  async markPaidOut(@Param('id') id: string) {
+    return this.adminService.markPaidOut(id);
+  }
 }
