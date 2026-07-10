@@ -9,6 +9,9 @@ node_modules/
 # Build output
 dist/
 
+# Local ephemeral evidence store (V1 — photos kept 24h, swept by EvidenceCleanupJob)
+var/
+
 # Prisma generated client
 src/generated/
 
