@@ -133,4 +133,34 @@ export class FinalizationService {
 
     return finalized ? 'finalized' : 'already';
   }
+
+  /**
+   * Caller-scoped read of the authenticated user's own payout status for a
+   * challenge (T-04-13/T-04-14). Scoped strictly by `participant: { userId }`
+   * — userId comes only from the verified JWT (@CurrentUser().id), never
+   * from client input, so a user can only ever read their own payout row.
+   * Returns null for a non-winner (no payout row exists).
+   */
+  async getMyPayout(
+    challengeId: string,
+    userId: string,
+  ): Promise<{ status: 'PAYOUT_PENDING' | 'PAID_OUT'; amount: string } | null> {
+    const payment = await this.prisma.payment.findFirst({
+      where: {
+        challengeId,
+        status: { in: ['PAYOUT_PENDING', 'PAID_OUT'] },
+        participant: { userId },
+      },
+      select: { status: true, amount: true },
+    });
+
+    if (!payment) {
+      return null;
+    }
+
+    return {
+      status: payment.status as 'PAYOUT_PENDING' | 'PAID_OUT',
+      amount: payment.amount.toString(),
+    };
+  }
 }
