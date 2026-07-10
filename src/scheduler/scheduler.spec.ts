@@ -1,8 +1,10 @@
 import { Test } from '@nestjs/testing';
 import { ReconciliationJob } from './reconciliation.job';
 import { DeadlineCancelJob } from './deadline-cancel.job';
+import { VoteCloseJob } from './vote-close.job';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
+import { VotingService } from '../voting/voting.service';
 import { IPaymentProvider } from '../payments/interfaces/payment-provider.interface';
 
 describe('ReconciliationJob (PAY-04, D-16)', () => {
@@ -174,5 +176,82 @@ describe('DeadlineCancelJob (D-02/D-07/D-09, CHAL-06 deadline path)', () => {
     await job.run();
 
     expect(paymentsService.processDeadline).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('VoteCloseJob (VOTE-05)', () => {
+  let job: VoteCloseJob;
+  let votingService: { resolveEvidence: jest.Mock };
+  let prisma: { evidence: { findMany: jest.Mock } };
+
+  const expiredEvidences = [{ id: 'evidence-1' }, { id: 'evidence-2' }];
+
+  beforeEach(async () => {
+    votingService = { resolveEvidence: jest.fn() };
+
+    prisma = {
+      evidence: {
+        findMany: jest.fn().mockResolvedValue(expiredEvidences),
+      },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        VoteCloseJob,
+        { provide: PrismaService, useValue: prisma },
+        { provide: VotingService, useValue: votingService },
+      ],
+    }).compile();
+
+    job = moduleRef.get(VoteCloseJob);
+  });
+
+  it('finds PENDING evidences past their 24h window and delegates each to resolveEvidence', async () => {
+    votingService.resolveEvidence.mockResolvedValue('accepted');
+
+    await job.run();
+
+    expect(prisma.evidence.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ status: 'PENDING' }),
+      }),
+    );
+    expect(votingService.resolveEvidence).toHaveBeenCalledWith('evidence-1');
+    expect(votingService.resolveEvidence).toHaveBeenCalledWith('evidence-2');
+    expect(votingService.resolveEvidence).toHaveBeenCalledTimes(2);
+  });
+
+  it('aggregates accepted/rejected counts from resolveEvidence results', async () => {
+    votingService.resolveEvidence
+      .mockResolvedValueOnce('accepted')
+      .mockResolvedValueOnce('rejected');
+
+    await job.run();
+
+    expect(votingService.resolveEvidence).toHaveBeenCalledTimes(2);
+  });
+
+  it('is idempotent: a second run resolves nothing new once the evidence is no longer PENDING', async () => {
+    votingService.resolveEvidence.mockResolvedValue('accepted');
+
+    await job.run();
+    expect(votingService.resolveEvidence).toHaveBeenCalledTimes(2);
+
+    // Second run: both evidences resolved (no longer PENDING), so the
+    // `status: 'PENDING'` query stops returning them.
+    prisma.evidence.findMany.mockResolvedValueOnce([]);
+    await job.run();
+
+    expect(votingService.resolveEvidence).toHaveBeenCalledTimes(2);
+  });
+
+  it('performs no new resolution when resolveEvidence itself reports already-resolved', async () => {
+    prisma.evidence.findMany.mockResolvedValueOnce([{ id: 'evidence-1' }]);
+    votingService.resolveEvidence.mockResolvedValueOnce('already-resolved');
+
+    await job.run();
+
+    expect(votingService.resolveEvidence).toHaveBeenCalledTimes(1);
+    expect(votingService.resolveEvidence).toHaveBeenCalledWith('evidence-1');
   });
 });
