@@ -15,6 +15,7 @@ import { EvidencesModule } from './evidences/evidences.module';
 import { VotingModule } from './voting/voting.module';
 import { RankingModule } from './ranking/ranking.module';
 import { ProfileModule } from './profile/profile.module';
+import { FinalizationModule } from './finalization/finalization.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { ProfileModule } from './profile/profile.module';
     VotingModule,
     RankingModule,
     ProfileModule,
+    FinalizationModule,
   ],
 })
 export class AppModule {}

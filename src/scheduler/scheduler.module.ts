@@ -2,10 +2,12 @@ import { Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { PaymentsModule } from '../payments/payments.module';
 import { VotingModule } from '../voting/voting.module';
+import { FinalizationModule } from '../finalization/finalization.module';
 import { ReconciliationJob } from './reconciliation.job';
 import { DeadlineCancelJob } from './deadline-cancel.job';
 import { EvidenceCleanupJob } from './evidence-cleanup.job';
 import { VoteCloseJob } from './vote-close.job';
+import { FinalizationJob } from '../finalization/finalization.job';
 
 /**
  * SchedulerModule registers the time-driven safety nets:
@@ -20,16 +22,23 @@ import { VoteCloseJob } from './vote-close.job';
  *   not using Cloudflare R2).
  * - VoteCloseJob sweeps PENDING Evidence rows past their 24h vote window and
  *   delegates each to VotingService.resolveEvidence (VOTE-05).
+ * - FinalizationJob sweeps ACTIVE Challenges every 15 min (SP-anchored) and
+ *   delegates each to FinalizationService.finalizeIfDone, which determines
+ *   winners (reusing RankingService), splits the prize to the exact centavo,
+ *   and idempotently records one PAYOUT_PENDING cash-out row per winner
+ *   (PAY-06, D-01/D-02/D-03).
  *
  * PrismaService is available via the @Global() PrismaModule — no explicit
  * import needed here. PaymentsModule is imported to reach PaymentsService
  * (processDeadline, handleWebhook, tryActivateChallenge) and the
  * 'PAYMENT_PROVIDER' token the payment jobs need. EvidenceCleanupJob needs
  * only ConfigService (global) to resolve the storage dir. VotingModule is
- * imported so VotingService is injectable into VoteCloseJob.
+ * imported so VotingService is injectable into VoteCloseJob. FinalizationModule
+ * is imported so FinalizationService (and transitively RankingService) is
+ * injectable into FinalizationJob.
  */
 @Module({
-  imports: [ScheduleModule.forRoot(), PaymentsModule, VotingModule],
-  providers: [ReconciliationJob, DeadlineCancelJob, EvidenceCleanupJob, VoteCloseJob],
+  imports: [ScheduleModule.forRoot(), PaymentsModule, VotingModule, FinalizationModule],
+  providers: [ReconciliationJob, DeadlineCancelJob, EvidenceCleanupJob, VoteCloseJob, FinalizationJob],
 })
 export class SchedulerModule {}
