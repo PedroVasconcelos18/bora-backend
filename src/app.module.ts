@@ -12,6 +12,7 @@ import { SchedulerModule } from './scheduler/scheduler.module';
 import { AdminModule } from './admin/admin.module';
 import { StorageModule } from './storage/storage.module';
 import { EvidencesModule } from './evidences/evidences.module';
+import { VotingModule } from './voting/voting.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { EvidencesModule } from './evidences/evidences.module';
     AdminModule,
     StorageModule,
     EvidencesModule,
+    VotingModule,
   ],
 })
 export class AppModule {}
