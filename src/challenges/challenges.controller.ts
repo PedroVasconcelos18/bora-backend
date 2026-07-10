@@ -38,7 +38,7 @@ export class ChallengesController {
   }
 
   /**
-   * GET /challenges — list challenges created by the authenticated user.
+   * GET /challenges — list challenges the authenticated user created or joined.
    */
   @Get()
   async list(@CurrentUser() user: UserPayload) {

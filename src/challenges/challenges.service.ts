@@ -111,11 +111,19 @@ export class ChallengesService {
   }
 
   /**
-   * List all challenges where the caller is the creator.
+   * List all challenges where the caller is the creator OR a participant
+   * (invited/joined). This is the "Seus desafios" home feed — non-creator
+   * participants must be able to reach challenges they paid into, not just
+   * ones they created.
    */
   async list(creatorId: string) {
     const challenges = await this.prisma.challenge.findMany({
-      where: { creatorId },
+      where: {
+        OR: [
+          { creatorId },
+          { participants: { some: { userId: creatorId } } },
+        ],
+      },
       include: {
         participants: {
           include: { user: { select: { id: true, name: true, email: true } } },
