@@ -13,6 +13,7 @@ import { AdminModule } from './admin/admin.module';
 import { StorageModule } from './storage/storage.module';
 import { EvidencesModule } from './evidences/evidences.module';
 import { VotingModule } from './voting/voting.module';
+import { RankingModule } from './ranking/ranking.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { VotingModule } from './voting/voting.module';
     StorageModule,
     EvidencesModule,
     VotingModule,
+    RankingModule,
   ],
 })
 export class AppModule {}
