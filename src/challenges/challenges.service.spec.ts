@@ -65,3 +65,70 @@ describe('ChallengesService.cancel', () => {
     expect(paymentsService.cancelChallenge).not.toHaveBeenCalled();
   });
 });
+
+describe('ChallengesService.list', () => {
+  let service: ChallengesService;
+  let prisma: { challenge: { findMany: jest.Mock } };
+
+  const activeChallengeJoinedAsParticipant = {
+    id: 'ch-active',
+    title: 'Corrida',
+    emoji: '🏃',
+    durationDays: 14,
+    collabAmount: 35,
+    platformFee: 10,
+    status: 'ACTIVE',
+    creatorId: 'someone-else',
+    participants: [
+      {
+        user: { id: 'participant-1', name: 'Amiga', email: 'a@x.com' },
+        status: 'PAID',
+      },
+    ],
+    invites: [],
+    createdAt: new Date(),
+  };
+
+  beforeEach(async () => {
+    prisma = {
+      challenge: {
+        findMany: jest.fn().mockResolvedValue([activeChallengeJoinedAsParticipant]),
+      },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        ChallengesService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: InvitesService, useValue: {} },
+        { provide: PaymentsService, useValue: {} },
+      ],
+    }).compile();
+
+    service = moduleRef.get(ChallengesService);
+  });
+
+  it('returns the ACTIVE challenge a non-creator PAID participant joined', async () => {
+    const result = await service.list('participant-1');
+
+    expect(result).toHaveLength(1);
+    expect(result[0].id).toBe('ch-active');
+    expect(result[0].collabAmount).toBe('35');
+    expect(result[0].platformFee).toBe('10');
+  });
+
+  it('queries prisma with an OR where-clause covering creator and participant membership', async () => {
+    await service.list('participant-1');
+
+    expect(prisma.challenge.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          OR: [
+            { creatorId: 'participant-1' },
+            { participants: { some: { userId: 'participant-1' } } },
+          ],
+        },
+      }),
+    );
+  });
+});
