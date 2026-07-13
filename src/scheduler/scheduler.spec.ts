@@ -342,10 +342,10 @@ describe('NotificationsListener error isolation (T-09-06, D-02/D-03, property V2
    * on: a real EventEmitterModule + a real NotificationsListener, wired to a
    * NotificationsService whose createMany/create REJECT — and asserts the
    * emit() call that triggered it still resolves normally. This is what
-   * makes `emit()` (never emitAsync) + the library's default
-   * suppressErrors=true a correctness guarantee, not just a convention: a bug
-   * in the listener can never propagate back into the payment/voting/
-   * finalization flow that emitted the event.
+   * makes `emit()` (never the awaited-dispatch variant) + the library's
+   * default suppressErrors=true a correctness guarantee, not just a
+   * convention: a bug in the listener can never propagate back into the
+   * payment/voting/finalization flow that emitted the event.
    */
   it('emit() resolves without throwing even when the listener throws inside every handler', async () => {
     const prisma = {
