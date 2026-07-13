@@ -1,11 +1,16 @@
 import { Test } from '@nestjs/testing';
+import { EventEmitter2, EventEmitterModule } from '@nestjs/event-emitter';
 import { ReconciliationJob } from './reconciliation.job';
 import { DeadlineCancelJob } from './deadline-cancel.job';
 import { VoteCloseJob } from './vote-close.job';
+import { EvidenceReminderJob } from './evidence-reminder.job';
 import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
 import { VotingService } from '../voting/voting.service';
 import { IPaymentProvider } from '../payments/interfaces/payment-provider.interface';
+import { NotificationsListener } from '../notifications/notifications.listener';
+import { NotificationsService } from '../notifications/notifications.service';
+import { saoPauloDay } from '../common/utils/sao-paulo-day.util';
 
 describe('ReconciliationJob (PAY-04, D-16)', () => {
   let job: ReconciliationJob;
@@ -253,5 +258,135 @@ describe('VoteCloseJob (VOTE-05)', () => {
 
     expect(votingService.resolveEvidence).toHaveBeenCalledTimes(1);
     expect(votingService.resolveEvidence).toHaveBeenCalledWith('evidence-1');
+  });
+});
+
+describe('EvidenceReminderJob (NOTIF-02 tipo 5, D-07 — the 5th cron)', () => {
+  let job: EvidenceReminderJob;
+  let eventEmitter: { emit: jest.Mock };
+  let prisma: { participant: { findMany: jest.Mock } };
+
+  const today = saoPauloDay();
+
+  const missingCandidate = {
+    id: 'participant-1',
+    userId: 'user-1',
+    challengeId: 'challenge-1',
+  };
+
+  beforeEach(async () => {
+    eventEmitter = { emit: jest.fn() };
+
+    prisma = {
+      participant: {
+        findMany: jest.fn().mockResolvedValue([missingCandidate]),
+      },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        EvidenceReminderJob,
+        { provide: PrismaService, useValue: prisma },
+        { provide: EventEmitter2, useValue: eventEmitter },
+      ],
+    }).compile();
+
+    job = moduleRef.get(EvidenceReminderJob);
+  });
+
+  it('queries PAID/ACTIVE participants of ACTIVE challenges with no evidence posted today', async () => {
+    await job.run();
+
+    expect(prisma.participant.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ['PAID', 'ACTIVE'] },
+          challenge: { status: 'ACTIVE' },
+          evidences: { none: { evidenceDate: today } },
+        }),
+      }),
+    );
+  });
+
+  it('emits exactly one evidence.reminder event per candidate found', async () => {
+    prisma.participant.findMany.mockResolvedValueOnce([
+      missingCandidate,
+      { id: 'participant-2', userId: 'user-2', challengeId: 'challenge-2' },
+    ]);
+
+    await job.run();
+
+    expect(eventEmitter.emit).toHaveBeenCalledTimes(2);
+    expect(eventEmitter.emit).toHaveBeenCalledWith('evidence.reminder', {
+      participantId: 'participant-1',
+      userId: 'user-1',
+      challengeId: 'challenge-1',
+      evidenceDate: today,
+    });
+  });
+
+  it('with zero candidates, emits nothing and still logs a summary', async () => {
+    prisma.participant.findMany.mockResolvedValueOnce([]);
+    const logSpy = jest.spyOn(job['logger'], 'log');
+
+    await job.run();
+
+    expect(eventEmitter.emit).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('found=0'));
+  });
+});
+
+describe('NotificationsListener error isolation (T-09-06, D-02/D-03, property V2)', () => {
+  /**
+   * Proves the property the whole phase's Denial-of-Service mitigation rests
+   * on: a real EventEmitterModule + a real NotificationsListener, wired to a
+   * NotificationsService whose createMany/create REJECT — and asserts the
+   * emit() call that triggered it still resolves normally. This is what
+   * makes `emit()` (never emitAsync) + the library's default
+   * suppressErrors=true a correctness guarantee, not just a convention: a bug
+   * in the listener can never propagate back into the payment/voting/
+   * finalization flow that emitted the event.
+   */
+  it('emit() resolves without throwing even when the listener throws inside every handler', async () => {
+    const prisma = {
+      challenge: { findUnique: jest.fn().mockResolvedValue({ title: 'Corrida' }) },
+      participant: {
+        findUnique: jest.fn().mockResolvedValue({ user: { name: 'Ana' } }),
+        findMany: jest.fn().mockResolvedValue([{ id: 'participant-1', userId: 'user-1' }]),
+      },
+      user: { findUnique: jest.fn() },
+      evidence: { findUnique: jest.fn(), count: jest.fn() },
+    };
+
+    const notifications = {
+      create: jest.fn().mockRejectedValue(new Error('boom — NotificationsService is down')),
+      createMany: jest.fn().mockRejectedValue(new Error('boom — NotificationsService is down')),
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [EventEmitterModule.forRoot()],
+      providers: [
+        NotificationsListener,
+        { provide: NotificationsService, useValue: notifications },
+        { provide: PrismaService, useValue: prisma },
+      ],
+    }).compile();
+
+    await moduleRef.init(); // required for EventSubscribersLoader to register @OnEvent handlers
+
+    const eventEmitter = moduleRef.get(EventEmitter2);
+
+    // emit() is synchronous dispatch and must never throw or reject, even
+    // though every downstream handler this event reaches will reject.
+    expect(() =>
+      eventEmitter.emit('challenge.activated', { challengeId: 'challenge-1' }),
+    ).not.toThrow();
+
+    // Give the listener's rejected promise a microtask tick to settle —
+    // asserting the test process is still alive (no unhandled rejection
+    // crash) is the point of this test, not any particular return value.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(notifications.createMany).toHaveBeenCalled();
   });
 });

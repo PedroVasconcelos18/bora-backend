@@ -8,6 +8,7 @@ import { DeadlineCancelJob } from './deadline-cancel.job';
 import { EvidenceCleanupJob } from './evidence-cleanup.job';
 import { VoteCloseJob } from './vote-close.job';
 import { FinalizationJob } from '../finalization/finalization.job';
+import { EvidenceReminderJob } from './evidence-reminder.job';
 
 /**
  * SchedulerModule registers the time-driven safety nets:
@@ -27,6 +28,12 @@ import { FinalizationJob } from '../finalization/finalization.job';
  *   winners (reusing RankingService), splits the prize to the exact centavo,
  *   and idempotently records one PAYOUT_PENDING cash-out row per winner
  *   (PAY-06, D-01/D-02/D-03).
+ * - EvidenceReminderJob (NOTIF-02, D-07) sweeps daily at 18h SP for PAID/
+ *   ACTIVE participants of ACTIVE challenges who haven't posted an evidence
+ *   yet today, and emits one 'evidence.reminder' event per participant — the
+ *   5th cron, and the only temporal notification type (tipo 5). No
+ *   notification logic lives in the job itself; it only finds candidates and
+ *   emits.
  *
  * PrismaService is available via the @Global() PrismaModule — no explicit
  * import needed here. PaymentsModule is imported to reach PaymentsService
@@ -35,10 +42,19 @@ import { FinalizationJob } from '../finalization/finalization.job';
  * only ConfigService (global) to resolve the storage dir. VotingModule is
  * imported so VotingService is injectable into VoteCloseJob. FinalizationModule
  * is imported so FinalizationService (and transitively RankingService) is
- * injectable into FinalizationJob.
+ * injectable into FinalizationJob. EvidenceReminderJob needs only
+ * PrismaService (global) and EventEmitter2 (global via EventEmitterModule.
+ * forRoot() in AppModule) — no additional import required.
  */
 @Module({
   imports: [ScheduleModule.forRoot(), PaymentsModule, VotingModule, FinalizationModule],
-  providers: [ReconciliationJob, DeadlineCancelJob, EvidenceCleanupJob, VoteCloseJob, FinalizationJob],
+  providers: [
+    ReconciliationJob,
+    DeadlineCancelJob,
+    EvidenceCleanupJob,
+    VoteCloseJob,
+    FinalizationJob,
+    EvidenceReminderJob,
+  ],
 })
 export class SchedulerModule {}
