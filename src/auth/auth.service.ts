@@ -15,7 +15,7 @@ import { UserPayload } from './strategies/jwt.strategy';
 // argon2id is used for PASSWORD hashing only — it's non-deterministic and not suitable
 // for DB lookups. SHA-256 is deterministic and sufficient for opaque bearer token
 // storage since the raw token has 122 bits of entropy (UUID v4).
-function hashRefreshToken(raw: string): string {
+export function hashRefreshToken(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');
 }
 

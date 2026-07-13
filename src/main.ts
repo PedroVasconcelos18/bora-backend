@@ -7,6 +7,11 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
+  // Trust exactly 1 hop (the Railway edge proxy) so req.ips is populated from
+  // X-Forwarded-For without letting a client spoof extra hops to dodge
+  // rate limiting (ThrottlerBehindProxyGuard reads req.ips[0]).
+  app.getHttpAdapter().getInstance().set('trust proxy', 1);
+
   // cookie-parser MUST come before passport middleware and route handlers
   app.use(cookieParser());
 
