@@ -13,14 +13,15 @@ datasource db {
 }
 
 model User {
-  id            String         @id @default(uuid())
-  email         String         @unique
-  name          String
-  passwordHash  String         @map("password_hash")
-  createdAt     DateTime       @default(now()) @map("created_at")
-  refreshTokens RefreshToken[]
-  participants  Participant[]
-  challenges    Challenge[]    @relation("CreatedChallenges")
+  id                  String                @id @default(uuid())
+  email               String                @unique
+  name                String
+  passwordHash        String                @map("password_hash")
+  createdAt           DateTime              @default(now()) @map("created_at")
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  participants        Participant[]
+  challenges          Challenge[]           @relation("CreatedChallenges")
 
   @@map("users")
 }
@@ -180,4 +181,16 @@ model RefreshToken {
   createdAt DateTime  @default(now()) @map("created_at")
 
   @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@map("password_reset_tokens")
 }
