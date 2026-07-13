@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { PrismaModule } from './prisma/prisma.module';
 import { HealthModule } from './health/health.module';
 import { AuthModule } from './auth/auth.module';
@@ -16,6 +17,7 @@ import { VotingModule } from './voting/voting.module';
 import { RankingModule } from './ranking/ranking.module';
 import { ProfileModule } from './profile/profile.module';
 import { FinalizationModule } from './finalization/finalization.module';
+import { NotificationsModule } from './notifications/notifications.module';
 
 @Module({
   imports: [
@@ -36,6 +38,12 @@ import { FinalizationModule } from './finalization/finalization.module';
     RankingModule,
     ProfileModule,
     FinalizationModule,
+    // D-01: registered once here (global:true is the library default) so
+    // EventEmitter2 is DI-injectable in any domain service (PaymentsModule,
+    // InvitesModule, etc.) without those modules importing EventEmitterModule
+    // themselves. NotificationsModule is the only listener.
+    EventEmitterModule.forRoot(),
+    NotificationsModule,
   ],
 })
 export class AppModule {}

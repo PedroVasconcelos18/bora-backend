@@ -22,6 +22,7 @@ model User {
   passwordResetTokens PasswordResetToken[]
   participants        Participant[]
   challenges          Challenge[]           @relation("CreatedChallenges")
+  notifications       Notification[]
 
   @@map("users")
 }
@@ -193,4 +194,31 @@ model PasswordResetToken {
   createdAt DateTime  @default(now()) @map("created_at")
 
   @@map("password_reset_tokens")
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String           @map("user_id")
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  entityId  String           @map("entity_id")
+  payload   Json             @default("{}")
+  readAt    DateTime?        @map("read_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  @@unique([userId, type, entityId])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+enum NotificationType {
+  INVITE_RECEIVED
+  PAYMENT_CONFIRMED
+  EVIDENCE_SUBMITTED
+  EVIDENCE_VALIDATED
+  EVIDENCE_REMINDER
+  CHALLENGE_FINALIZED
+  CHALLENGE_CANCELLED
+  CHALLENGE_ACTIVATED
+  EVIDENCE_REJECTED
 }
