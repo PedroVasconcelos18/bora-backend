@@ -7,6 +7,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client.js';
 import { IObjectStorage, UploadUrlResult } from '../storage/interfaces/object-storage.interface';
@@ -28,6 +29,7 @@ export class EvidencesService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject('OBJECT_STORAGE') private readonly objectStorage: IObjectStorage,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   /**
@@ -148,6 +150,15 @@ export class EvidencesService {
       this.logger.log(
         `confirmEvidence: created evidence ${evidence.id} for participant ${participant.id} (day=${evidenceDate})`,
       );
+
+      // NOTIF-02 (D-02): create() is a single isolated write — no
+      // $transaction here — so this is already post-commit by construction,
+      // no restructuring needed.
+      this.eventEmitter.emit('evidence.submitted', {
+        evidenceId: evidence.id,
+        participantId: participant.id,
+        challengeId,
+      });
 
       return evidence;
     } catch (err) {

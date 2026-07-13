@@ -1,11 +1,13 @@
 import { Test } from '@nestjs/testing';
 import { ConflictException, ForbiddenException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { VotingService } from './voting.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client.js';
 
 describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
   let service: VotingService;
+  let eventEmitter: { emit: jest.Mock };
   let prisma: {
     evidence: { findUnique: jest.Mock; updateMany: jest.Mock };
     participant: { findUnique: jest.Mock; count: jest.Mock };
@@ -29,6 +31,8 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
   };
 
   beforeEach(async () => {
+    eventEmitter = { emit: jest.fn() };
+
     prisma = {
       evidence: {
         findUnique: jest.fn().mockResolvedValue(openEvidence),
@@ -48,7 +52,11 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
     };
 
     const moduleRef = await Test.createTestingModule({
-      providers: [VotingService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        VotingService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: EventEmitter2, useValue: eventEmitter },
+      ],
     }).compile();
 
     service = moduleRef.get(VotingService);
@@ -114,6 +122,23 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
       });
     });
 
+    it('NOTIF-02: emits evidence.resolved with outcome="accepted", post-commit', async () => {
+      prisma.evidence.findUnique.mockResolvedValueOnce(pendingEvidence);
+      prisma.participant.count.mockResolvedValueOnce(3);
+      prisma.vote.count.mockResolvedValueOnce(1);
+      prisma.evidence.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.resolveEvidence(evidenceId);
+
+      expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+      expect(eventEmitter.emit).toHaveBeenCalledWith('evidence.resolved', {
+        evidenceId,
+        participantId: pendingEvidence.participantId,
+        challengeId: pendingEvidence.challengeId,
+        outcome: 'accepted',
+      });
+    });
+
     it('rejects when eligibleVoters < 2 * explicitNao (2 < 2*2)', async () => {
       prisma.evidence.findUnique.mockResolvedValueOnce(pendingEvidence);
       prisma.participant.count.mockResolvedValueOnce(2);
@@ -127,6 +152,19 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
         where: { id: evidenceId, status: 'PENDING' },
         data: { status: 'REJECTED', resolvedAt: expect.any(Date) },
       });
+    });
+
+    it('NOTIF-02: emits evidence.resolved with outcome="rejected"', async () => {
+      prisma.evidence.findUnique.mockResolvedValueOnce(pendingEvidence);
+      prisma.participant.count.mockResolvedValueOnce(2);
+      prisma.vote.count.mockResolvedValueOnce(2);
+      prisma.evidence.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.resolveEvidence(evidenceId);
+
+      expect(eventEmitter.emit).toHaveBeenCalledWith('evidence.resolved', expect.objectContaining({
+        outcome: 'rejected',
+      }));
     });
 
     it('is idempotent: resolving an already-resolved evidence a second time returns already-resolved and does not re-write', async () => {
@@ -143,6 +181,22 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
 
       expect(second).toBe('already-resolved');
       expect(prisma.evidence.updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('NOTIF-02: an already-resolved outcome (race with another cron tick) emits nothing', async () => {
+      prisma.evidence.findUnique.mockResolvedValueOnce({ ...pendingEvidence, status: 'ACCEPTED' });
+
+      const result = await service.resolveEvidence(evidenceId);
+
+      expect(result).toBe('already-resolved');
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
+    });
+
+    it('ROLLBACK-SAFETY (V1): if the $transaction rejects, emit is never called', async () => {
+      prisma.$transaction.mockRejectedValueOnce(new Error('transaction rolled back'));
+
+      await expect(service.resolveEvidence(evidenceId)).rejects.toThrow('transaction rolled back');
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
     });
   });
 });

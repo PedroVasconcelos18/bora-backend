@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { RankingService } from '../ranking/ranking.service';
 import { saoPauloDay } from '../common/utils/sao-paulo-day.util';
@@ -20,6 +21,7 @@ export class FinalizationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly rankingService: RankingService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   /**
@@ -126,6 +128,18 @@ export class FinalizationService {
 
       return true;
     });
+
+    if (finalized) {
+      // NOTIF-02 (D-02): post-commit; winnersWithShares/ranking.prize were
+      // already computed from reads BEFORE the transaction, so nothing here
+      // needs to be re-derived. Skipped entirely on the idempotent
+      // already-finalized path (finalized === false).
+      this.eventEmitter.emit('challenge.finalized', {
+        challengeId,
+        winnerParticipantIds: winnersWithShares.map((w) => w.id),
+        prize: ranking.prize,
+      });
+    }
 
     this.logger.log(
       `finalizeIfDone: challenge ${challengeId} winners=${winnersWithShares.length} prize=${ranking.prize} finalized=${finalized}`,

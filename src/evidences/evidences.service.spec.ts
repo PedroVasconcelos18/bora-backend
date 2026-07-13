@@ -1,5 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { ConflictException, ForbiddenException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { EvidencesService } from './evidences.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { IObjectStorage } from '../storage/interfaces/object-storage.interface';
@@ -8,6 +9,7 @@ import { Prisma } from '../generated/prisma/client.js';
 describe('EvidencesService (EVID-01/02/03)', () => {
   let service: EvidencesService;
   let objectStorage: jest.Mocked<IObjectStorage>;
+  let eventEmitter: { emit: jest.Mock };
   let prisma: {
     participant: { findUnique: jest.Mock };
     evidence: { findUnique: jest.Mock; create: jest.Mock };
@@ -35,6 +37,8 @@ describe('EvidencesService (EVID-01/02/03)', () => {
       getUploadUrl: jest.fn(),
     };
 
+    eventEmitter = { emit: jest.fn() };
+
     prisma = {
       participant: {
         findUnique: jest.fn().mockResolvedValue(paidParticipant),
@@ -50,6 +54,7 @@ describe('EvidencesService (EVID-01/02/03)', () => {
         EvidencesService,
         { provide: PrismaService, useValue: prisma },
         { provide: 'OBJECT_STORAGE', useValue: objectStorage },
+        { provide: EventEmitter2, useValue: eventEmitter },
       ],
     }).compile();
 
@@ -140,6 +145,29 @@ describe('EvidencesService (EVID-01/02/03)', () => {
         service.confirmEvidence(userId, challengeId, 'evidences/some-other-challenge/some-other-participant/2020-01-01.jpg'),
       ).rejects.toThrow(ForbiddenException);
       expect(prisma.evidence.create).not.toHaveBeenCalled();
+    });
+
+    it('NOTIF-02: emits evidence.submitted once for a successful confirm — already post-commit by construction (no $transaction)', async () => {
+      const createdEvidence = { id: 'evidence-1', challengeId, participantId: paidParticipant.id };
+      prisma.evidence.create.mockResolvedValueOnce(createdEvidence);
+      // Mirrors the real R2 adapter echoing back the exact key it was asked
+      // to sign, so the objectKey confirmEvidence checks matches the
+      // server-derived key for today (same pattern as the P2002 test above).
+      objectStorage.getUploadUrl.mockImplementation(async ({ key }) => ({
+        uploadUrl: 'https://r2.example.com/signed-put',
+        objectKey: key,
+        expiresAt: new Date(),
+      }));
+      const { objectKey } = await service.presignUpload(userId, challengeId, 'image/jpeg');
+
+      await service.confirmEvidence(userId, challengeId, objectKey);
+
+      expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+      expect(eventEmitter.emit).toHaveBeenCalledWith('evidence.submitted', {
+        evidenceId: 'evidence-1',
+        participantId: paidParticipant.id,
+        challengeId,
+      });
     });
   });
 });

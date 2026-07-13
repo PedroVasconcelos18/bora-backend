@@ -1,5 +1,6 @@
 import { ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { IEmailProvider } from '../email/interfaces/email-provider.interface';
 import { PaymentsService, CashInResult } from '../payments/payments.service';
@@ -46,6 +47,7 @@ export class InvitesService {
     private readonly config: ConfigService,
     @Inject('EMAIL_PROVIDER') private readonly emailProvider: IEmailProvider,
     private readonly paymentsService: PaymentsService,
+    private readonly eventEmitter: EventEmitter2,
   ) {
     // Use FRONTEND_URL to build invite links; fall back to localhost for dev
     this.appDomain =
@@ -216,6 +218,16 @@ export class InvitesService {
           `Failed to send invite email to ${invite.targetEmail}: ${String(err)}`,
         );
       }
+
+      // NOTIF-02 (D-02): unconditional — even if the email send above
+      // failed, the notification and the email are independent channels.
+      // The listener resolves a User by targetEmail; no account yet is a
+      // silent no-op, not an error (Pitfall 4).
+      this.eventEmitter.emit('invite.sent', {
+        inviteId: invite.token,
+        targetEmail: invite.targetEmail,
+        challengeId,
+      });
 
       results.push({
         inviteId: challengeId,

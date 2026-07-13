@@ -1,4 +1,5 @@
 import { Test } from '@nestjs/testing';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { FinalizationService } from './finalization.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RankingService, RankingParticipant, RankingResult } from '../ranking/ranking.service';
@@ -28,6 +29,7 @@ describe('FinalizationService.finalizeIfDone (PAY-06, D-02/D-03/D-04/D-06/D-07)'
     $transaction: jest.Mock;
   };
   let rankingService: { getRanking: jest.Mock };
+  let eventEmitter: { emit: jest.Mock };
 
   // A challenge that started 10 days ago with a 3-day duration is well past
   // its last day (SP) regardless of when this test suite runs.
@@ -52,12 +54,14 @@ describe('FinalizationService.finalizeIfDone (PAY-06, D-02/D-03/D-04/D-06/D-07)'
     };
 
     rankingService = { getRanking: jest.fn() };
+    eventEmitter = { emit: jest.fn() };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         FinalizationService,
         { provide: PrismaService, useValue: prisma },
         { provide: RankingService, useValue: rankingService },
+        { provide: EventEmitter2, useValue: eventEmitter },
       ],
     }).compile();
 
@@ -130,6 +134,48 @@ describe('FinalizationService.finalizeIfDone (PAY-06, D-02/D-03/D-04/D-06/D-07)'
         externalId: null,
       },
     });
+  });
+
+  it('NOTIF-02: emits challenge.finalized once (post-commit) with the winner ids and the exact ranking.prize string', async () => {
+    const ranking: RankingResult = {
+      prize: '100.01',
+      leaders: ['B', 'A', 'C'],
+      participants: [
+        makeParticipant({ id: 'participant-b', name: 'B', validatedDays: 3, isLeader: true }),
+        makeParticipant({ id: 'participant-a', name: 'A', validatedDays: 3, isLeader: true }),
+        makeParticipant({ id: 'participant-c', name: 'C', validatedDays: 3, isLeader: true }),
+      ],
+    };
+    rankingService.getRanking.mockResolvedValueOnce(ranking);
+    prisma.participant.findMany.mockResolvedValueOnce([
+      { id: 'participant-a', pixKey: 'a@pix' },
+      { id: 'participant-b', pixKey: 'b@pix' },
+      { id: 'participant-c', pixKey: 'c@pix' },
+    ]);
+
+    await service.finalizeIfDone('challenge-1');
+
+    expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+    expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.finalized', {
+      challengeId: 'challenge-1',
+      winnerParticipantIds: ['participant-a', 'participant-b', 'participant-c'],
+      prize: '100.01',
+    });
+  });
+
+  it('NOTIF-02: the idempotent already-finalized path (finalized === false) emits nothing', async () => {
+    rankingService.getRanking.mockResolvedValueOnce({
+      prize: '20.00',
+      leaders: ['A'],
+      participants: [makeParticipant({ id: 'participant-a', name: 'A', validatedDays: 3, isLeader: true })],
+    });
+    prisma.participant.findMany.mockResolvedValueOnce([{ id: 'participant-a', pixKey: 'a@pix' }]);
+    tx.$executeRaw.mockResolvedValueOnce(0); // a concurrent tick already flipped the status
+
+    const result = await service.finalizeIfDone('challenge-1');
+
+    expect(result).toBe('already');
+    expect(eventEmitter.emit).not.toHaveBeenCalled();
   });
 
   it('splits a two-way tied prize of 90.01 into 45.01 + 45.00 (remainder centavo to first winner by id)', async () => {

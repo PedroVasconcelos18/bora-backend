@@ -1,6 +1,7 @@
 import { Test } from '@nestjs/testing';
 import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createHmac } from 'crypto';
 import { PaymentsService } from './payments.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -11,6 +12,7 @@ describe('PaymentsService', () => {
   let service: PaymentsService;
   let psp: jest.Mocked<IPaymentProvider>;
   let config: { getOrThrow: jest.Mock };
+  let eventEmitter: { emit: jest.Mock };
   let tx: {
     payment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     participant: { update: jest.Mock; count: jest.Mock };
@@ -59,6 +61,8 @@ describe('PaymentsService', () => {
       getOrThrow: jest.fn().mockReturnValue(webhookSecret),
     };
 
+    eventEmitter = { emit: jest.fn() };
+
     tx = {
       payment: {
         findUnique: jest.fn(),
@@ -103,6 +107,7 @@ describe('PaymentsService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: config },
         { provide: 'PAYMENT_PROVIDER', useValue: psp },
+        { provide: EventEmitter2, useValue: eventEmitter },
       ],
     }).compile();
 
@@ -229,6 +234,62 @@ describe('PaymentsService', () => {
       });
     });
 
+    it('NOTIF-02: emits payment.confirmed once (post-commit) but NOT challenge.activated when the payment approves without reaching >=3 paid', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+      tx.$executeRaw.mockResolvedValue(0); // tryActivateChallenge did not transition
+
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(eventEmitter.emit).toHaveBeenCalledWith('payment.confirmed', {
+        paymentId: 'payment-1',
+        participantId: 'participant-1',
+        challengeId: 'challenge-1',
+      });
+      expect(eventEmitter.emit).not.toHaveBeenCalledWith('challenge.activated', expect.anything());
+    });
+
+    it('NOTIF-02: emits BOTH payment.confirmed and challenge.activated (CALL SITE A) when the payment approval also activates the challenge', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+      tx.$executeRaw.mockResolvedValue(1); // tryActivateChallenge transitioned
+
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(eventEmitter.emit).toHaveBeenCalledWith('payment.confirmed', expect.objectContaining({
+        paymentId: 'payment-1',
+      }));
+      expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.activated', { challengeId: 'challenge-1' });
+    });
+
+    it('NOTIF-02: a re-delivered webhook for an already-APPROVED payment emits nothing (idempotency)', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue({ ...existingPayment, status: 'APPROVED' });
+
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
+    });
+
+    it('NOTIF-02: a webhook whose confirmed.status is not "approved" emits nothing', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'pending', externalReference: 'participant-1' });
+      tx.payment.findUnique.mockResolvedValue(existingPayment);
+
+      await service.handleWebhook('mp-external-id-123', {});
+
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
+    });
+
+    it('ROLLBACK-SAFETY (V1): if the $transaction rejects, emit is never called', async () => {
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      prisma.$transaction.mockRejectedValueOnce(new Error('transaction rolled back'));
+
+      await expect(service.handleWebhook('mp-external-id-123', {})).rejects.toThrow(
+        'transaction rolled back',
+      );
+      expect(eventEmitter.emit).not.toHaveBeenCalled();
+    });
+
     it('calls psp.getPayment (verify-via-API) before any Prisma write', async () => {
       const callOrder: string[] = [];
       psp.getPayment.mockImplementation(async () => {
@@ -323,6 +384,25 @@ describe('PaymentsService', () => {
         data: { status: 'REFUND_PENDING' },
       });
     });
+
+    it('NOTIF-02: emits challenge.cancelled once, post-commit, with reason="manual" for the creator cancel path', async () => {
+      await service.cancelChallenge('challenge-1', 'manual');
+
+      expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+      expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.cancelled', {
+        challengeId: 'challenge-1',
+        reason: 'manual',
+      });
+    });
+
+    it('NOTIF-02: emits challenge.cancelled with reason="deadline" for the deadline-sweep path', async () => {
+      await service.cancelChallenge('challenge-1', 'deadline');
+
+      expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.cancelled', {
+        challengeId: 'challenge-1',
+        reason: 'deadline',
+      });
+    });
   });
 
   describe('processDeadline', () => {
@@ -354,6 +434,17 @@ describe('PaymentsService', () => {
       expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
     });
 
+    it('NOTIF-02: emits challenge.activated (CALL SITE B — the reconciliation/deadline path, distinct from handleWebhook) when >=3 paid at the deadline', async () => {
+      tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'WAITING' });
+      tx.participant.count.mockResolvedValue(3);
+      tx.$executeRaw.mockResolvedValue(1);
+
+      await service.processDeadline('challenge-1');
+
+      expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+      expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.activated', { challengeId: 'challenge-1' });
+    });
+
     it('cancels into the refund queue when <3 paid at the deadline', async () => {
       tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'WAITING' });
       tx.participant.count.mockResolvedValue(2);
@@ -372,6 +463,20 @@ describe('PaymentsService', () => {
         where: { challengeId: 'challenge-1', status: 'APPROVED' },
         data: { status: 'REFUND_PENDING' },
       });
+    });
+
+    it('NOTIF-02: <3 paid at the deadline emits challenge.cancelled (via cancelChallenge) but never challenge.activated', async () => {
+      tx.challenge.findUnique.mockResolvedValue({ id: 'challenge-1', status: 'WAITING' });
+      tx.participant.count.mockResolvedValue(2);
+
+      await service.processDeadline('challenge-1');
+
+      expect(eventEmitter.emit).toHaveBeenCalledTimes(1);
+      expect(eventEmitter.emit).toHaveBeenCalledWith('challenge.cancelled', {
+        challengeId: 'challenge-1',
+        reason: 'deadline',
+      });
+      expect(eventEmitter.emit).not.toHaveBeenCalledWith('challenge.activated', expect.anything());
     });
 
     it('running processDeadline twice on the same challenge produces the same terminal result (idempotent)', async () => {

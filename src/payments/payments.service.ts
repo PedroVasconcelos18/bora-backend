@@ -7,6 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
@@ -28,6 +29,17 @@ export interface DeadlineResult {
   action: 'none' | 'activated' | 'cancelled';
 }
 
+// NOTIF-02: the shape handleWebhook's $transaction resolves to — captured so
+// the payment.confirmed/challenge.activated emits (D-02) can happen strictly
+// after the tx commits, never inside its callback.
+interface HandleWebhookTxResult {
+  activated: boolean;
+  alreadyProcessed: boolean;
+  paymentId?: string;
+  participantId?: string;
+  challengeId?: string;
+}
+
 // D-08: each individual Pix cobrança (QR + copia-e-cola) expires in 30 minutes.
 const PIX_EXPIRATION_MINUTES = 30;
 
@@ -39,6 +51,7 @@ export class PaymentsService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     @Inject('PAYMENT_PROVIDER') private readonly psp: IPaymentProvider,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   /**
@@ -147,14 +160,14 @@ export class PaymentsService {
   async handleWebhook(dataId: string, rawBody: unknown): Promise<HandleWebhookResult> {
     const confirmed = await this.psp.getPayment(dataId);
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx): Promise<HandleWebhookTxResult> => {
       const existing = await tx.payment.findUnique({ where: { externalId: dataId } });
 
       if (!existing) {
         this.logger.warn(
           `handleWebhook: no Payment row found for externalId=${dataId} — ignoring webhook`,
         );
-        return { activated: false };
+        return { activated: false, alreadyProcessed: false };
       }
 
       if (existing.status === 'APPROVED') {
@@ -162,7 +175,7 @@ export class PaymentsService {
         this.logger.log(
           `handleWebhook: payment ${existing.id} (externalId=${dataId}) already APPROVED — idempotent no-op`,
         );
-        return { activated: false };
+        return { activated: false, alreadyProcessed: true };
       }
 
       await tx.payment.update({
@@ -174,7 +187,7 @@ export class PaymentsService {
         this.logger.log(
           `handleWebhook: payment ${existing.id} (externalId=${dataId}) confirmed status=${confirmed.status} — not yet approved`,
         );
-        return { activated: false };
+        return { activated: false, alreadyProcessed: false };
       }
 
       await tx.payment.update({
@@ -195,8 +208,36 @@ export class PaymentsService {
         }`,
       );
 
-      return { activated };
+      return {
+        activated,
+        alreadyProcessed: false,
+        paymentId: existing.id,
+        participantId: existing.participantId,
+        challengeId: existing.challengeId,
+      };
     });
+
+    // NOTIF-02 (D-02): emit strictly post-commit, and only along the path
+    // that actually approved a payment this call — never for the !existing
+    // no-op, the already-APPROVED idempotency guard, or a not-yet-approved
+    // confirmed.status. `alreadyProcessed` doubles as the idempotency guard
+    // that keeps a duplicate webhook delivery / reconciliation re-run from
+    // ever emitting a second 'payment.confirmed' for the same Payment.
+    if (!result.alreadyProcessed && result.paymentId) {
+      this.eventEmitter.emit('payment.confirmed', {
+        paymentId: result.paymentId,
+        participantId: result.participantId,
+        challengeId: result.challengeId,
+      });
+
+      if (result.activated) {
+        // tipo 8, CALL SITE A — see Pattern 6 / Pitfall 2: processDeadline
+        // below is the second, easy-to-forget call site.
+        this.eventEmitter.emit('challenge.activated', { challengeId: result.challengeId });
+      }
+    }
+
+    return { activated: result.activated };
   }
 
   /**
@@ -257,6 +298,12 @@ export class PaymentsService {
       });
     });
 
+    // NOTIF-02 (D-02): post-commit. This single emit site covers BOTH callers
+    // (the creator's manual cancel endpoint and processDeadline's deadline
+    // path below) — mirrors why the money-side consequences already live
+    // here instead of being duplicated per caller.
+    this.eventEmitter.emit('challenge.cancelled', { challengeId, reason });
+
     this.logger.log(
       `cancelChallenge: challenge ${challengeId} CANCELLED (reason=${reason}); pending invites EXPIRED; approved payments -> REFUND_PENDING`,
     );
@@ -303,6 +350,8 @@ export class PaymentsService {
     });
 
     if (outcome.action === 'cancel') {
+      // cancelChallenge already emits 'challenge.cancelled' internally
+      // (Pattern 5) — no separate emit needed here.
       await this.cancelChallenge(challengeId, 'deadline');
       this.logger.log(
         `processDeadline: challenge ${challengeId} <3 paid at deadline — cancelled into refund queue`,
@@ -311,6 +360,11 @@ export class PaymentsService {
     }
 
     if (outcome.action === 'activated') {
+      // NOTIF-02 (D-02), tipo 8 CALL SITE B — ⚠️ the one every fase-9
+      // reviewer flagged as easy to forget: tryActivateChallenge receives
+      // `tx` and can't emit itself, so this reconciliation/deadline path
+      // needs its own post-commit emit, separate from handleWebhook's.
+      this.eventEmitter.emit('challenge.activated', { challengeId });
       this.logger.log(`processDeadline: challenge ${challengeId} >=3 paid at deadline — activated`);
     }
 

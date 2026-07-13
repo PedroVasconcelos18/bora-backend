@@ -5,12 +5,22 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client.js';
 import { saoPauloDay } from '../common/utils/sao-paulo-day.util';
 
 export type VoteValue = 'SIM' | 'NAO';
 export type ResolveEvidenceResult = 'accepted' | 'rejected' | 'already-resolved';
+
+// NOTIF-02: the shape resolveEvidence's $transaction resolves to — the IDs
+// the post-commit 'evidence.resolved' emit (D-02) needs, without exposing
+// them through the method's public ResolveEvidenceResult return type.
+interface ResolveEvidenceTxResult {
+  outcome: ResolveEvidenceResult;
+  participantId?: string;
+  challengeId?: string;
+}
 
 export interface VotableEvidence {
   id: string;
@@ -25,7 +35,10 @@ export interface VotableEvidence {
 export class VotingService {
   private readonly logger = new Logger(VotingService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
   /**
    * Resolves the caller's own Participant row for the challenge — never a
@@ -125,10 +138,10 @@ export class VotingService {
    * (abstention) always folds toward acceptance (empate=válida, abstenção=sim).
    */
   async resolveEvidence(evidenceId: string): Promise<ResolveEvidenceResult> {
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx): Promise<ResolveEvidenceTxResult> => {
       const evidence = await tx.evidence.findUnique({ where: { id: evidenceId } });
       if (!evidence || evidence.status !== 'PENDING') {
-        return 'already-resolved';
+        return { outcome: 'already-resolved' };
       }
 
       const eligibleVoters = await tx.participant.count({
@@ -148,12 +161,30 @@ export class VotingService {
       });
 
       if (count !== 1) {
-        return 'already-resolved';
+        return { outcome: 'already-resolved' };
       }
 
-      this.logger.log(`resolveEvidence: evidence ${evidenceId} resolved -> ${newStatus}`);
-
-      return newStatus === 'ACCEPTED' ? 'accepted' : 'rejected';
+      return {
+        outcome: newStatus === 'ACCEPTED' ? 'accepted' : 'rejected',
+        participantId: evidence.participantId,
+        challengeId: evidence.challengeId,
+      };
     });
+
+    // NOTIF-02 (D-02): post-commit only, and only for the two outcomes that
+    // actually resolved an evidence this call — 'already-resolved' (a race
+    // with another overlapping cron tick, or a re-run) emits nothing.
+    if (result.outcome === 'accepted' || result.outcome === 'rejected') {
+      this.eventEmitter.emit('evidence.resolved', {
+        evidenceId,
+        participantId: result.participantId,
+        challengeId: result.challengeId,
+        outcome: result.outcome, // listener bifurcates tipo 4 (accepted) vs tipo 9 (rejected)
+      });
+    }
+
+    this.logger.log(`resolveEvidence: evidence ${evidenceId} resolved -> ${result.outcome}`);
+
+    return result.outcome;
   }
 }
