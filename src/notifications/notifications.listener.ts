@@ -77,7 +77,14 @@ export class NotificationsListener {
     targetEmail: string;
     challengeId: string;
   }): Promise<void> {
-    const user = await this.prisma.user.findUnique({ where: { email: payload.targetEmail } });
+    // User.email is always stored lowercased (signup/validateUser both
+    // .toLowerCase() it); targetEmail is free-typed by the challenge creator,
+    // so the lookup must normalize it or a mixed-case invite silently misses
+    // an existing account (same bug the signup backfill below closes for the
+    // no-account-yet path).
+    const user = await this.prisma.user.findUnique({
+      where: { email: payload.targetEmail.toLowerCase() },
+    });
     if (!user) {
       return;
     }
@@ -365,5 +372,62 @@ export class NotificationsListener {
     }));
 
     await this.notifications.createMany(inputs);
+  }
+
+  /**
+   * Backfill de convites pendentes no signup (quick 260714-gl5). Fecha o
+   * buraco em que `handleInviteSent` retorna em silêncio quando o convidado
+   * ainda não tem conta (Pitfall 4, linha ~80): quando a conta finalmente é
+   * criada, materializa aqui a `INVITE_RECEIVED` que nunca foi gravada.
+   * `entityId = invite.token` — o mesmo valor que `dispatchInvites` já manda
+   * como `inviteId` em `invite.sent` — para o deep-link do frontend abrir o
+   * convite certo. `notifications.create` (não `createMany`) engole `P2002`
+   * por linha, então rodar o backfill duas vezes para o mesmo usuário nunca
+   * duplica.
+   */
+  @OnEvent('user.signed_up')
+  async handleUserSignedUp(payload: { userId: string; email: string }): Promise<void> {
+    const invites = await this.prisma.invite.findMany({
+      where: {
+        status: 'PENDING',
+        targetEmail: { equals: payload.email, mode: 'insensitive' },
+      },
+      include: {
+        challenge: {
+          select: { title: true, collabAmount: true, creator: { select: { name: true } } },
+        },
+      },
+    });
+
+    const now = new Date();
+
+    for (const invite of invites) {
+      // T-GL5-01 mitigation: the query above is only a pre-filter. Postgres
+      // compiles Prisma's `mode: 'insensitive'` to ILIKE, where `_` and `%`
+      // are wildcards — a targetEmail of 'joaoXdoe@x.com' would match a
+      // signup of 'joao_doe@x.com' and leak that invite's challenge title,
+      // creator name, and TOKEN to the wrong account. Re-check the match in
+      // JS with a plain string comparison before ever creating a
+      // notification.
+      if (invite.targetEmail.toLowerCase() !== payload.email.toLowerCase()) {
+        continue;
+      }
+
+      // expiresAt: null means no expiration — do NOT skip it.
+      if (invite.expiresAt !== null && invite.expiresAt <= now) {
+        continue;
+      }
+
+      await this.notifications.create({
+        userId: payload.userId,
+        type: 'INVITE_RECEIVED',
+        entityId: invite.token,
+        payload: {
+          inviterName: invite.challenge.creator.name,
+          challengeTitle: invite.challenge.title,
+          amount: invite.challenge.collabAmount.toString(),
+        },
+      });
+    }
   }
 }

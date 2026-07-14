@@ -11,6 +11,7 @@ describe('NotificationsListener (NOTIF-02, D-04/D-06 audience)', () => {
     challenge: { findUnique: jest.Mock };
     participant: { findUnique: jest.Mock; findMany: jest.Mock; count: jest.Mock };
     evidence: { findUnique: jest.Mock; count: jest.Mock };
+    invite: { findMany: jest.Mock };
   };
 
   beforeEach(async () => {
@@ -24,6 +25,7 @@ describe('NotificationsListener (NOTIF-02, D-04/D-06 audience)', () => {
       challenge: { findUnique: jest.fn() },
       participant: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
       evidence: { findUnique: jest.fn(), count: jest.fn() },
+      invite: { findMany: jest.fn() },
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -78,6 +80,145 @@ describe('NotificationsListener (NOTIF-02, D-04/D-06 audience)', () => {
           amount: '25.00',
         },
       });
+    });
+
+    it('looks up the user by lowercased targetEmail, even when targetEmail has uppercase letters', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce(null);
+
+      await listener.handleInviteSent({
+        inviteId: 'invite-token-1',
+        targetEmail: 'Joao@Example.COM',
+        challengeId: 'challenge-1',
+      });
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'joao@example.com' },
+      });
+    });
+  });
+
+  describe('user.signed_up (backfill de convites pendentes)', () => {
+    const nowFixed = new Date('2026-07-14T12:00:00.000Z');
+    const inThePast = new Date('2026-07-01T00:00:00.000Z');
+    const inTheFuture = new Date('2026-08-01T00:00:00.000Z');
+
+    beforeEach(() => {
+      jest.useFakeTimers().setSystemTime(nowFixed);
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    function inviteFixture(overrides: Record<string, unknown> = {}) {
+      return {
+        token: 'invite-token-1',
+        targetEmail: 'joao@example.com',
+        expiresAt: null,
+        challenge: {
+          title: 'Corrida matinal',
+          collabAmount: { toString: () => '25.00' },
+          creator: { name: 'Rafa' },
+        },
+        ...overrides,
+      };
+    }
+
+    it('creates one INVITE_RECEIVED per PENDING invite, entityId = invite.token', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([
+        inviteFixture({ token: 'invite-token-1' }),
+        inviteFixture({ token: 'invite-token-2' }),
+      ]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(notifications.create).toHaveBeenCalledTimes(2);
+      expect(notifications.create).toHaveBeenNthCalledWith(1, {
+        userId: 'user-1',
+        type: 'INVITE_RECEIVED',
+        entityId: 'invite-token-1',
+        payload: {
+          inviterName: 'Rafa',
+          challengeTitle: 'Corrida matinal',
+          amount: '25.00',
+        },
+      });
+      expect(notifications.create).toHaveBeenNthCalledWith(2, {
+        userId: 'user-1',
+        type: 'INVITE_RECEIVED',
+        entityId: 'invite-token-2',
+        payload: {
+          inviterName: 'Rafa',
+          challengeTitle: 'Corrida matinal',
+          amount: '25.00',
+        },
+      });
+    });
+
+    it('matches targetEmail case-insensitively against the new account email', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([
+        inviteFixture({ targetEmail: 'Joao@Example.COM' }),
+      ]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(notifications.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not treat "_" in targetEmail as an ILIKE wildcard (T-GL5-01)', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([
+        inviteFixture({ targetEmail: 'joaoXdoe@example.com' }),
+      ]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao_doe@example.com' });
+
+      expect(notifications.create).not.toHaveBeenCalled();
+    });
+
+    it('skips an invite with expiresAt in the past', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([inviteFixture({ expiresAt: inThePast })]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(notifications.create).not.toHaveBeenCalled();
+    });
+
+    it('creates a notification for an invite with expiresAt: null (no expiration)', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([inviteFixture({ expiresAt: null })]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(notifications.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('creates a notification for an invite with expiresAt in the future', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([inviteFixture({ expiresAt: inTheFuture })]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(notifications.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('resolves without throwing and creates nothing when findMany returns []', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([]);
+
+      await expect(
+        listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' }),
+      ).resolves.toBeUndefined();
+
+      expect(notifications.create).not.toHaveBeenCalled();
+    });
+
+    it('queries findMany with status: PENDING (ACCEPTED invites are never fetched)', async () => {
+      prisma.invite.findMany.mockResolvedValueOnce([]);
+
+      await listener.handleUserSignedUp({ userId: 'user-1', email: 'joao@example.com' });
+
+      expect(prisma.invite.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ status: 'PENDING' }),
+        }),
+      );
     });
   });
 
