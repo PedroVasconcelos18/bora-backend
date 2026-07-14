@@ -11,6 +11,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
+import { describeError } from './utils/describe-error.util';
 import { verifyMpSignature } from './utils/verify-signature.util';
 
 export interface CashInResult {
@@ -101,11 +102,11 @@ export class PaymentsService {
       });
     } catch (err) {
       // GAP 3 / T-02-G3: MP internals (401/400 bodies, stack) never leave the
-      // process — the client only ever sees a generic pt-BR 503.
+      // process — the client only ever sees a generic pt-BR 503. Mas o log
+      // precisa carregar o motivo: o SDK do MP rejeita com um objeto simples,
+      // não com um Error (describeError, senão vira "[object Object]").
       this.logger.error(
-        `createCashIn: psp.createPixCharge failed for participant ${participantId}: ${
-          err instanceof Error ? err.stack ?? err.message : String(err)
-        }`,
+        `createCashIn: psp.createPixCharge failed for participant ${participantId}: ${describeError(err)}`,
       );
       throw new ServiceUnavailableException(
         'Não foi possível gerar a cobrança Pix agora. Tente novamente.',
