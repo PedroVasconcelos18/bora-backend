@@ -1,12 +1,14 @@
 import {
   Injectable,
   ConflictException,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { createHash } from 'crypto';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { SignupDto } from './dto/signup.dto';
 import { UserPayload } from './strategies/jwt.strategy';
@@ -21,10 +23,13 @@ export function hashRefreshToken(raw: string): string {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
     private config: ConfigService,
+    private eventEmitter: EventEmitter2,
   ) {}
 
   async signup(dto: SignupDto): Promise<UserPayload> {
@@ -46,6 +51,28 @@ export class AuthService {
         passwordHash,
       },
     });
+
+    // Backfill de convites pendentes (quick 260714-gl5): materializa
+    // INVITE_RECEIVED para todo Invite PENDING não-expirado que já existia
+    // pro e-mail dessa conta nova. `emitAsync` (não `emit`) porque a UI
+    // consulta GET /notifications logo após o signup — precisa esperar o
+    // handler terminar, senão vira corrida. signup não roda em
+    // `$transaction`: o `user.create` acima já está commitado, não há
+    // rollback a temer — só o throw a conter. `@nestjs/event-emitter` já
+    // suprime erro de listener por padrão (suppressErrors), mas essa
+    // garantia não pode depender de um default de biblioteca: o try/catch
+    // aqui é defesa em profundidade, o backfill NUNCA pode derrubar a
+    // criação da conta.
+    try {
+      await this.eventEmitter.emitAsync('user.signed_up', {
+        userId: user.id,
+        email: user.email,
+      });
+    } catch (err) {
+      this.logger.error(
+        `Falha ao emitir user.signed_up para ${user.id}: ${String(err)}`,
+      );
+    }
 
     return { id: user.id, email: user.email, name: user.name };
   }
