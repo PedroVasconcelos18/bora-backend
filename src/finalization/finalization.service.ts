@@ -86,11 +86,13 @@ export class FinalizationService {
     }
 
     const winnerIds = winners.map((w) => w.id).sort();
+    // D-2 (T-i98): the payout snapshot falls back to the winner's profile
+    // key when they never set a per-challenge one.
     const pixKeyRows = await this.prisma.participant.findMany({
       where: { id: { in: winnerIds } },
-      select: { id: true, pixKey: true },
+      select: { id: true, pixKey: true, user: { select: { pixKey: true } } },
     });
-    const pixKeyById = new Map(pixKeyRows.map((row) => [row.id, row.pixKey]));
+    const pixKeyById = new Map(pixKeyRows.map((row) => [row.id, row.pixKey ?? row.user.pixKey]));
 
     const totalCents = Math.round(parseFloat(ranking.prize) * 100);
     const shareCents = Math.floor(totalCents / winnerIds.length);

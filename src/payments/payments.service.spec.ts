@@ -23,6 +23,7 @@ describe('PaymentsService', () => {
   let prisma: {
     participant: { findUnique: jest.Mock; update: jest.Mock };
     payment: { create: jest.Mock };
+    user: { update: jest.Mock };
     $transaction: jest.Mock;
   };
 
@@ -46,7 +47,7 @@ describe('PaymentsService', () => {
       status: 'WAITING',
       collabAmount: 25 as unknown as number,
     },
-    user: { id: 'user-1', email: 'joao@example.com', name: 'João' },
+    user: { id: 'user-1', email: 'joao@example.com', name: 'João', pixKey: null },
   };
 
   const webhookSecret = 'test-webhook-secret-fixture';
@@ -98,6 +99,7 @@ describe('PaymentsService', () => {
           status: 'PENDING',
         }),
       },
+      user: { update: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(tx)),
     };
 
@@ -150,6 +152,46 @@ describe('PaymentsService', () => {
 
       await expect(service.createCashIn('participant-1')).rejects.toThrow(BadRequestException);
       expect(psp.createPixCharge).not.toHaveBeenCalled();
+    });
+
+    it('trims a pay-time pixKey before persisting it to the participant (T-i98)', async () => {
+      await service.createCashIn('participant-1', '  joao@pix  ');
+
+      expect(prisma.participant.update).toHaveBeenCalledWith({
+        where: { id: 'participant-1' },
+        data: { pixKey: 'joao@pix' },
+      });
+    });
+
+    it('backfills the profile key (user.update, keyed on participant.userId) when the paying user has none yet (D-3/T-i98-02)', async () => {
+      await service.createCashIn('participant-1', 'joao@pix');
+
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { pixKey: 'joao@pix' },
+      });
+    });
+
+    it('does NOT backfill the profile key when the paying user already has one', async () => {
+      prisma.participant.findUnique.mockResolvedValueOnce({
+        ...waitingParticipant,
+        user: { ...waitingParticipant.user, pixKey: 'existing@pix' },
+      });
+
+      await service.createCashIn('participant-1', 'new@pix');
+
+      expect(prisma.participant.update).toHaveBeenCalledWith({
+        where: { id: 'participant-1' },
+        data: { pixKey: 'new@pix' },
+      });
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('a whitespace-only pixKey persists nothing (neither participant nor user update)', async () => {
+      await service.createCashIn('participant-1', '   ');
+
+      expect(prisma.participant.update).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
     });
 
     it('maps a psp.createPixCharge failure to a friendly ServiceUnavailableException instead of leaking a raw 500 (GAP 3)', async () => {

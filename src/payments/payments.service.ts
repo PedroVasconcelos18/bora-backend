@@ -80,11 +80,24 @@ export class PaymentsService {
     }
 
     // D-17: capture the Pix key at pay time for the eventual refund queue.
-    if (pixKey) {
+    // D-3 (T-i98-02): a trimmed, non-blank key also convenience-backfills the
+    // paying user's OWN profile key (participant.userId from the loaded row,
+    // never a client-supplied id) — but only when their profile has none yet,
+    // so a later profile edit is never silently overwritten by an older
+    // per-challenge value.
+    const trimmedKey = pixKey?.trim();
+    if (trimmedKey) {
       await this.prisma.participant.update({
         where: { id: participantId },
-        data: { pixKey },
+        data: { pixKey: trimmedKey },
       });
+
+      if (!participant.user.pixKey) {
+        await this.prisma.user.update({
+          where: { id: participant.userId },
+          data: { pixKey: trimmedKey },
+        });
+      }
     }
 
     // D-15: always send an idempotency key on charge creation.
