@@ -7,6 +7,7 @@ describe('ProfileService.getStats (PROF-01)', () => {
   let prisma: {
     participant: { count: jest.Mock };
     evidence: { count: jest.Mock };
+    user: { findUnique: jest.Mock; update: jest.Mock };
   };
 
   const userId = 'user-1';
@@ -15,6 +16,7 @@ describe('ProfileService.getStats (PROF-01)', () => {
     prisma = {
       participant: { count: jest.fn() },
       evidence: { count: jest.fn() },
+      user: { findUnique: jest.fn(), update: jest.fn() },
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -67,5 +69,82 @@ describe('ProfileService.getStats (PROF-01)', () => {
     const evidenceWhere = prisma.evidence.count.mock.calls[0][0].where;
     expect(participantWhere.userId).toBe(userId);
     expect(evidenceWhere.participant.userId).toBe(userId);
+  });
+});
+
+describe('ProfileService.getProfile/updatePixKey (T-i98-01, D-1/D-4)', () => {
+  let service: ProfileService;
+  let prisma: {
+    participant: { count: jest.Mock };
+    evidence: { count: jest.Mock };
+    user: { findUnique: jest.Mock; update: jest.Mock };
+  };
+
+  const userId = 'user-1';
+
+  beforeEach(async () => {
+    prisma = {
+      participant: { count: jest.fn() },
+      evidence: { count: jest.fn() },
+      user: { findUnique: jest.fn(), update: jest.fn() },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [ProfileService, { provide: PrismaService, useValue: prisma }],
+    }).compile();
+
+    service = moduleRef.get(ProfileService);
+  });
+
+  it("getProfile returns the row's pixKey, scoped to the caller's id", async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: 'joao@pix' });
+
+    const result = await service.getProfile(userId);
+
+    expect(result).toEqual({ pixKey: 'joao@pix' });
+    expect(prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: userId },
+      select: { pixKey: true },
+    });
+  });
+
+  it('getProfile returns { pixKey: null } when the user has no key set', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: null });
+
+    const result = await service.getProfile(userId);
+
+    expect(result).toEqual({ pixKey: null });
+  });
+
+  it('updatePixKey trims surrounding whitespace before storing', async () => {
+    prisma.user.update.mockResolvedValueOnce({});
+
+    const result = await service.updatePixKey(userId, '  joao@pix  ');
+
+    expect(result).toEqual({ pixKey: 'joao@pix' });
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: userId },
+      data: { pixKey: 'joao@pix' },
+    });
+  });
+
+  it('updatePixKey stores null when the input is all-whitespace (clears the key)', async () => {
+    prisma.user.update.mockResolvedValueOnce({});
+
+    const result = await service.updatePixKey(userId, '   ');
+
+    expect(result).toEqual({ pixKey: null });
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: userId },
+      data: { pixKey: null },
+    });
+  });
+
+  it('updatePixKey stores a non-empty value unchanged (no format validation, D-4)', async () => {
+    prisma.user.update.mockResolvedValueOnce({});
+
+    const result = await service.updatePixKey(userId, '11987654321');
+
+    expect(result).toEqual({ pixKey: '11987654321' });
   });
 });

@@ -6,6 +6,10 @@ export interface ProfileStats {
   validatedDays: number;
 }
 
+export interface ProfilePixKey {
+  pixKey: string | null;
+}
+
 /**
  * PROF-01 aggregate-read model, mirroring RankingService's aggregate-read
  * shape over Prisma (no writes, no caching — always computed live).
@@ -26,5 +30,29 @@ export class ProfileService {
       where: { participant: { userId }, status: 'ACCEPTED' },
     });
     return { activeChallenges, validatedDays };
+  }
+
+  /**
+   * GET /profile (D-1 canonical Pix key). Scoped strictly to `userId` (D-12),
+   * mirroring getStats — never accepts a user id from the caller.
+   */
+  async getProfile(userId: string): Promise<ProfilePixKey> {
+    const row = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { pixKey: true },
+    });
+    return { pixKey: row?.pixKey ?? null };
+  }
+
+  /**
+   * PATCH /profile (D-4: trim-only, no format validation). A trimmed-empty
+   * value clears the key (stores null); a non-empty trimmed value is stored
+   * verbatim.
+   */
+  async updatePixKey(userId: string, rawPixKey: string | undefined): Promise<ProfilePixKey> {
+    const trimmed = (rawPixKey ?? '').trim();
+    const value = trimmed.length > 0 ? trimmed : null;
+    await this.prisma.user.update({ where: { id: userId }, data: { pixKey: value } });
+    return { pixKey: value };
   }
 }
