@@ -38,14 +38,15 @@ export class AdminService {
    * status REFUND_PENDING IS a queue entry; this just shapes it for the
    * operator: participant name, amount (Decimal -> string, mirrors the
    * codebase's established shaping pattern), and Pix key (D-17, captured at
-   * pay time on the paying Participant).
+   * pay time on the paying Participant) — falling back to the participant's
+   * user's profile key (D-2/T-i98) when no per-challenge key was ever set.
    */
   async listRefunds(): Promise<RefundQueueRow[]> {
     const payments = await this.prisma.payment.findMany({
       where: { status: 'REFUND_PENDING' },
       include: {
         challenge: { select: { title: true } },
-        participant: { select: { pixKey: true, user: { select: { name: true } } } },
+        participant: { select: { pixKey: true, user: { select: { name: true, pixKey: true } } } },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -55,7 +56,7 @@ export class AdminService {
       challengeTitle: payment.challenge.title,
       participantName: payment.participant.user.name,
       amount: payment.amount.toString(),
-      pixKey: payment.participant.pixKey,
+      pixKey: payment.participant.pixKey ?? payment.participant.user.pixKey,
     }));
   }
 
@@ -91,13 +92,16 @@ export class AdminService {
    * winner name, prize amount (Decimal -> string), and the SNAPSHOTTED Pix
    * key (D-09, `payment.pixKey`) rather than the live `participant.pixKey` —
    * a later profile edit must not rewrite a historical payout's destination.
+   * The snapshot still wins when present; the live participant/user fallback
+   * chain (D-2/T-i98) only fills older rows created before the snapshot
+   * carried the profile-key fallback.
    */
   async listPayouts(): Promise<PayoutQueueRow[]> {
     const payments = await this.prisma.payment.findMany({
       where: { status: 'PAYOUT_PENDING' },
       include: {
         challenge: { select: { title: true } },
-        participant: { select: { user: { select: { name: true } } } },
+        participant: { select: { pixKey: true, user: { select: { name: true, pixKey: true } } } },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -107,7 +111,7 @@ export class AdminService {
       challengeTitle: payment.challenge.title,
       winnerName: payment.participant.user.name,
       amount: payment.amount.toString(),
-      pixKey: payment.pixKey,
+      pixKey: payment.pixKey ?? payment.participant.pixKey ?? payment.participant.user.pixKey,
     }));
   }
 

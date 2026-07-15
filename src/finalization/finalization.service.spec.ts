@@ -108,9 +108,9 @@ describe('FinalizationService.finalizeIfDone (PAY-06, D-02/D-03/D-04/D-06/D-07)'
     };
     rankingService.getRanking.mockResolvedValueOnce(ranking);
     prisma.participant.findMany.mockResolvedValueOnce([
-      { id: 'participant-a', pixKey: 'a@pix' },
-      { id: 'participant-b', pixKey: 'b@pix' },
-      { id: 'participant-c', pixKey: 'c@pix' },
+      { id: 'participant-a', pixKey: 'a@pix', user: { pixKey: 'a-profile@pix' } },
+      { id: 'participant-b', pixKey: 'b@pix', user: { pixKey: 'b-profile@pix' } },
+      { id: 'participant-c', pixKey: 'c@pix', user: { pixKey: 'c-profile@pix' } },
     ]);
 
     const result = await service.finalizeIfDone('challenge-1');
@@ -217,6 +217,29 @@ describe('FinalizationService.finalizeIfDone (PAY-06, D-02/D-03/D-04/D-06/D-07)'
     expect(result).toBe('finalized');
     const amounts = tx.payment.create.mock.calls.map((call) => call[0].data.amount as string);
     expect(amounts).toEqual(['10.00', '10.00']);
+  });
+
+  it("falls back to the winner's profile pixKey (user.pixKey) when their participant.pixKey is null (D-2/T-i98)", async () => {
+    rankingService.getRanking.mockResolvedValueOnce({
+      prize: '20.00',
+      leaders: ['A', 'B'],
+      participants: [
+        makeParticipant({ id: 'participant-a', name: 'A', validatedDays: 3, isLeader: true }),
+        makeParticipant({ id: 'participant-b', name: 'B', validatedDays: 3, isLeader: true }),
+      ],
+    });
+    prisma.participant.findMany.mockResolvedValueOnce([
+      { id: 'participant-a', pixKey: null, user: { pixKey: 'a-profile@pix' } },
+      { id: 'participant-b', pixKey: 'b@pix', user: { pixKey: 'b-profile@pix' } },
+    ]);
+
+    await service.finalizeIfDone('challenge-1');
+
+    const pixKeysByParticipant = new Map(
+      tx.payment.create.mock.calls.map((call) => [call[0].data.participantId as string, call[0].data.pixKey]),
+    );
+    expect(pixKeysByParticipant.get('participant-a')).toBe('a-profile@pix');
+    expect(pixKeysByParticipant.get('participant-b')).toBe('b@pix');
   });
 
   it("is idempotent: calling finalizeIfDone twice yields exactly one set of PAYOUT_PENDING rows (second call returns 'already', creates none)", async () => {
