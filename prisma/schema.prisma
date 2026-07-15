@@ -18,6 +18,7 @@ model User {
   name                String
   passwordHash        String                @map("password_hash")
   createdAt           DateTime              @default(now()) @map("created_at")
+  pixKey              String?               @map("pix_key")
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
   participants        Participant[]
