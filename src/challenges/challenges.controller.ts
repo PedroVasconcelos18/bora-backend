@@ -14,6 +14,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserPayload } from '../auth/strategies/jwt.strategy';
 import { ChallengesService } from './challenges.service';
 import { ParticipantsService } from '../participants/participants.service';
+import { InvitesService } from '../invites/invites.service';
 import { CreateChallengeDto } from './dto/create-challenge.dto';
 
 @Controller('challenges')
@@ -22,6 +23,7 @@ export class ChallengesController {
   constructor(
     private readonly challengesService: ChallengesService,
     private readonly participantsService: ParticipantsService,
+    private readonly invitesService: InvitesService,
   ) {}
 
   /**
@@ -65,6 +67,16 @@ export class ChallengesController {
   @Get(':id/participants')
   async getParticipants(@Param('id') id: string) {
     return this.participantsService.getWaitingRoomStatus(id);
+  }
+
+  /**
+   * GET /challenges/:id/invites — creator-only list of still-pending invites
+   * (feedback QA 5a), for the waiting-room invitee-management list (edit
+   * email / delete). Non-creator -> ForbiddenException (in InvitesService).
+   */
+  @Get(':id/invites')
+  async getPendingInvites(@Param('id') id: string, @CurrentUser() user: UserPayload) {
+    return this.invitesService.listPendingForChallenge(id, user.id);
   }
 
   /**

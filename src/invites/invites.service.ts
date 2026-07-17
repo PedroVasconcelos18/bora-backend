@@ -1,4 +1,11 @@
-import { ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
@@ -35,6 +42,13 @@ export interface AcceptResult {
 export interface AcceptAndPayResult extends CashInResult {
   participantId: string;
   challengeId: string;
+}
+
+export interface PendingInvite {
+  id: string;
+  email: string;
+  status: string;
+  createdAt: Date;
 }
 
 @Injectable()
@@ -180,6 +194,99 @@ export class InvitesService {
       participantId: accepted.participantId,
       challengeId: accepted.challengeId,
     };
+  }
+
+  /**
+   * List still-pending invites for a challenge (feedback QA 5a). Creator-only:
+   * the invitee-management list (edit email / delete) is a creator affordance,
+   * so a non-creator gets a ForbiddenException rather than the list.
+   */
+  async listPendingForChallenge(challengeId: string, userId: string): Promise<PendingInvite[]> {
+    const challenge = await this.prisma.challenge.findUnique({
+      where: { id: challengeId },
+      select: { id: true, creatorId: true },
+    });
+    if (!challenge) {
+      throw new NotFoundException('Desafio não encontrado.');
+    }
+    if (challenge.creatorId !== userId) {
+      throw new ForbiddenException('Só o criador pode ver os convites deste desafio.');
+    }
+
+    const invites = await this.prisma.invite.findMany({
+      where: { challengeId, status: 'PENDING' },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    return invites.map((i) => ({
+      id: i.id,
+      email: i.targetEmail,
+      status: i.status,
+      createdAt: i.createdAt,
+    }));
+  }
+
+  /**
+   * Load a PENDING invite and assert the caller created its challenge — the
+   * shared guard for the creator-only edit/delete actions below. Rejects a
+   * non-creator (Forbidden) and an already-accepted/expired invite (Conflict,
+   * a consumed invite has a Participant row and editing the email would be a
+   * no-op that silently diverges from reality).
+   */
+  private async loadEditableInvite(inviteId: string, userId: string) {
+    const invite = await this.prisma.invite.findUnique({
+      where: { id: inviteId },
+      include: { challenge: true },
+    });
+    if (!invite) {
+      throw new NotFoundException('Convite não encontrado.');
+    }
+    if (invite.challenge.creatorId !== userId) {
+      throw new ForbiddenException('Só o criador pode gerenciar os convites deste desafio.');
+    }
+    if (invite.status !== 'PENDING') {
+      throw new ConflictException('Este convite já foi aceito e não pode mais ser alterado.');
+    }
+    return invite;
+  }
+
+  /**
+   * Edit a pending invite's target email (feedback QA 5a) and re-dispatch the
+   * invitation to the new address. Creator-only, PENDING-only.
+   */
+  async updateEmail(inviteId: string, userId: string, targetEmail: string): Promise<PendingInvite> {
+    const invite = await this.loadEditableInvite(inviteId, userId);
+    const email = targetEmail.trim();
+
+    const updated = await this.prisma.invite.update({
+      where: { id: inviteId },
+      data: { targetEmail: email },
+    });
+
+    // Reenvia o convite (email + notificação) pro novo endereço. Reaproveita o
+    // mesmo dispatch da criação — falha de email não aborta (log e segue).
+    await this.dispatchInvites(
+      invite.challengeId,
+      invite.challenge.title,
+      invite.challenge.emoji,
+      [{ token: updated.token, targetEmail: updated.targetEmail }],
+    );
+
+    return {
+      id: updated.id,
+      email: updated.targetEmail,
+      status: updated.status,
+      createdAt: updated.createdAt,
+    };
+  }
+
+  /**
+   * Delete a pending invite (feedback QA 5a). Creator-only, PENDING-only.
+   */
+  async remove(inviteId: string, userId: string): Promise<{ id: string; removed: true }> {
+    await this.loadEditableInvite(inviteId, userId);
+    await this.prisma.invite.delete({ where: { id: inviteId } });
+    return { id: inviteId, removed: true };
   }
 
   /**
