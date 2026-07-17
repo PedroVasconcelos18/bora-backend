@@ -18,6 +18,12 @@ export interface WaitingRoomParticipant {
   paid: boolean;
 }
 
+/** A still-pending invite (invited email that has not accepted yet). */
+export interface WaitingRoomPendingInvite {
+  id: string;
+  email: string;
+}
+
 export interface WaitingRoomStatusResult {
   status: string;
   deadline: Date;
@@ -25,6 +31,7 @@ export interface WaitingRoomStatusResult {
   totalCount: number;
   prize: string;
   participants: WaitingRoomParticipant[];
+  pendingInvites: WaitingRoomPendingInvite[];
 }
 
 // D-07: challenge payment window is 3 days from creation.
@@ -121,6 +128,13 @@ export class ParticipantsService {
           include: { user: { select: { name: true } } },
           orderBy: { paidAt: { sort: 'asc', nulls: 'last' } },
         },
+        // Convidados que ainda não aceitaram só existem como Invite (token) —
+        // sem eles a turma esperada fica invisível na sala de espera (feedback
+        // QA 5a/5b/5c: "0 de 1" e prêmio R$ 0,00 quando havia 3 convidados).
+        invites: {
+          where: { status: 'PENDING' },
+          orderBy: { createdAt: 'asc' },
+        },
       },
     });
 
@@ -129,11 +143,16 @@ export class ParticipantsService {
     }
 
     const paidCount = challenge.participants.filter((p) => p.status === 'PAID').length;
-    const totalCount = challenge.participants.length;
+
+    // Turma esperada = participantes que já aceitaram + convites ainda pendentes.
+    // O "N de M pagaram" e o prêmio "se todo mundo pagar" contam essa turma
+    // inteira, não só quem já pagou (senão o prêmio fica sempre R$ 0,00 no início).
+    const pendingInvites = challenge.invites ?? [];
+    const expectedCount = challenge.participants.length + pendingInvites.length;
 
     const collabAmount = Number(challenge.collabAmount);
     const platformFee = Number(challenge.platformFee);
-    const prizeValue = Math.max(0, collabAmount * paidCount - platformFee);
+    const prizeValue = Math.max(0, collabAmount * expectedCount - platformFee);
 
     const deadline = new Date(
       challenge.createdAt.getTime() + PAYMENT_WINDOW_DAYS * 24 * 60 * 60 * 1000,
@@ -143,11 +162,15 @@ export class ParticipantsService {
       status: challenge.status,
       deadline,
       paidCount,
-      totalCount,
+      totalCount: expectedCount,
       prize: prizeValue.toFixed(2),
       participants: challenge.participants.map((p) => ({
         name: p.user.name,
         paid: p.status === 'PAID',
+      })),
+      pendingInvites: pendingInvites.map((i) => ({
+        id: i.id,
+        email: i.targetEmail,
       })),
     };
   }
