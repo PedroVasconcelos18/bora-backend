@@ -20,6 +20,7 @@ export interface ChallengeWithLinks {
   status: string;
   creatorId: string;
   createdAt: Date;
+  startsAt: Date | null;
   copyableLinks: InviteWithLink[];
 }
 
@@ -48,7 +49,10 @@ export class ChallengesService {
     // Run DB writes in a single transaction
     const { challenge, inviteTokens } = await this.prisma.$transaction(
       async (tx) => {
-        // 1. Create challenge in WAITING
+        // 1. Create challenge in WAITING. `startsAt` guarda a data de início
+        // planejada (feedback): a ativação automática (>=3 pagos) só dispara a
+        // partir dela; sem data escolhida fica null e o desafio começa assim
+        // que a turma paga (comportamento antigo).
         const challenge = await tx.challenge.create({
           data: {
             title: dto.title,
@@ -58,6 +62,7 @@ export class ChallengesService {
             platformFee: 10,
             status: 'WAITING',
             creatorId,
+            startsAt: dto.startDate ? new Date(dto.startDate) : null,
           },
         });
 
@@ -106,6 +111,7 @@ export class ChallengesService {
       status: challenge.status,
       creatorId: challenge.creatorId,
       createdAt: challenge.createdAt,
+      startsAt: challenge.startsAt,
       copyableLinks,
     };
   }
@@ -193,5 +199,67 @@ export class ChallengesService {
     await this.paymentsService.cancelChallenge(challengeId, 'manual');
 
     return { status: 'CANCELLED' };
+  }
+
+  /**
+   * Creator-initiated "começar agora" (feedback): start the challenge before
+   * its planned start date once the group is fully settled — only the payers
+   * remain (invited-but-not-accepted removed) and everyone in has paid.
+   *
+   * Guards: caller is the creator, challenge is still WAITING, no PENDING
+   * invites remain, at least 2 participants, and every participant is PAID.
+   * The atomic transition (and the same set of pré-conditions re-checked
+   * inside a $transaction against races) lives in
+   * PaymentsService.startNowActivate — this method produces the friendly
+   * pt-BR errors and delegates the state change.
+   */
+  async startNow(challengeId: string, callerId: string): Promise<{ status: string }> {
+    const challenge = await this.prisma.challenge.findUnique({
+      where: { id: challengeId },
+    });
+
+    if (!challenge) {
+      throw new NotFoundException('Desafio não encontrado.');
+    }
+
+    if (challenge.creatorId !== callerId) {
+      throw new ForbiddenException('Apenas o criador pode iniciar o desafio.');
+    }
+
+    if (challenge.status !== 'WAITING') {
+      throw new ConflictException(
+        'Este desafio já começou ou não está mais aguardando turma.',
+      );
+    }
+
+    const pendingInvites = await this.prisma.invite.count({
+      where: { challengeId, status: 'PENDING' },
+    });
+    if (pendingInvites > 0) {
+      throw new ConflictException(
+        'Ainda há convidados que não aceitaram. Remova-os ou espere aceitarem antes de começar.',
+      );
+    }
+
+    const participants = await this.prisma.participant.findMany({
+      where: { challengeId },
+      select: { status: true },
+    });
+    const everyonePaid =
+      participants.length >= 2 && participants.every((p) => p.status === 'PAID');
+    if (!everyonePaid) {
+      throw new ConflictException(
+        'Todo mundo precisa ter pago para começar o desafio agora.',
+      );
+    }
+
+    const { started } = await this.paymentsService.startNowActivate(challengeId);
+    if (!started) {
+      throw new ConflictException(
+        'Não foi possível iniciar o desafio agora. Atualize a página e tente de novo.',
+      );
+    }
+
+    return { status: 'ACTIVE' };
   }
 }

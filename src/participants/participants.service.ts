@@ -32,6 +32,14 @@ export interface WaitingRoomStatusResult {
   prize: string;
   participants: WaitingRoomParticipant[];
   pendingInvites: WaitingRoomPendingInvite[];
+  /** Data de início planejada (feedback) — null quando o criador não escolheu. */
+  startsAt: Date | null;
+  /**
+   * True quando o criador pode "começar agora": WAITING, sem convites
+   * pendentes, >=2 participantes e todos PAID. Espelha as pré-condições de
+   * ChallengesService.startNow (o backend é a autoridade).
+   */
+  canStartNow: boolean;
 }
 
 // D-07: challenge payment window is 3 days from creation.
@@ -158,6 +166,15 @@ export class ParticipantsService {
       challenge.createdAt.getTime() + PAYMENT_WINDOW_DAYS * 24 * 60 * 60 * 1000,
     );
 
+    // "Começar agora" (feedback): liberado quando só sobram pagantes — nenhum
+    // convite pendente, pelo menos 2 participantes e todos PAID. Espelha as
+    // pré-condições de startNow; o botão fica escondido fora disso.
+    const canStartNow =
+      challenge.status === 'WAITING' &&
+      pendingInvites.length === 0 &&
+      challenge.participants.length >= 2 &&
+      challenge.participants.every((p) => p.status === 'PAID');
+
     return {
       status: challenge.status,
       deadline,
@@ -172,6 +189,8 @@ export class ParticipantsService {
         id: i.id,
         email: i.targetEmail,
       })),
+      startsAt: challenge.startsAt,
+      canStartNow,
     };
   }
 }

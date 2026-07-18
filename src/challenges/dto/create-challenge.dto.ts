@@ -1,9 +1,11 @@
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  IsDateString,
   IsEmail,
   IsInt,
   IsNumber,
+  IsOptional,
   IsString,
   Max,
   Min,
@@ -27,6 +29,14 @@ export class CreateChallengeDto {
   @Max(200, { message: 'A colaboração máxima é R$ 200.' })
   @Transform(({ value }: { value: unknown }) => Number(value))
   collabAmount!: number;
+
+  // Data de início planejada (YYYY-MM-DD). Opcional: sem ela o desafio segue o
+  // comportamento antigo (ativa assim que a turma paga). Com ela, a ativação
+  // automática só acontece a partir dessa data — o criador pode antecipar pelo
+  // botão "começar agora" quando todo mundo já pagou.
+  @IsOptional()
+  @IsDateString({}, { message: 'Data de início inválida.' })
+  startDate?: string;
 
   @IsEmail({}, { each: true })
   @ArrayMinSize(2, { message: 'Convide pelo menos 2 amigos (mínimo de 3 pessoas).' })

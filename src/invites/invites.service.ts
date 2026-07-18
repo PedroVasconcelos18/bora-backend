@@ -281,6 +281,32 @@ export class InvitesService {
   }
 
   /**
+   * Re-dispatch a pending invite to its CURRENT email without changing it
+   * (feedback: botão "reenviar convite"). Creator-only, PENDING-only. Reuses
+   * the existing token (link stays valid) and the same dispatch path as
+   * creation — email failure is logged, not fatal. Distinct from updateEmail:
+   * gives the creator an explicit resend affordance for the "e-mail ficou
+   * igual" case, where re-saving the edit was a confusing no-op.
+   */
+  async resend(inviteId: string, userId: string): Promise<PendingInvite> {
+    const invite = await this.loadEditableInvite(inviteId, userId);
+
+    await this.dispatchInvites(
+      invite.challengeId,
+      invite.challenge.title,
+      invite.challenge.emoji,
+      [{ token: invite.token, targetEmail: invite.targetEmail }],
+    );
+
+    return {
+      id: invite.id,
+      email: invite.targetEmail,
+      status: invite.status,
+      createdAt: invite.createdAt,
+    };
+  }
+
+  /**
    * Delete a pending invite (feedback QA 5a). Creator-only, PENDING-only.
    */
   async remove(inviteId: string, userId: string): Promise<{ id: string; removed: true }> {

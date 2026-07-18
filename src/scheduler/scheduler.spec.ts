@@ -115,17 +115,28 @@ describe('ReconciliationJob (PAY-04, D-16)', () => {
 
 describe('DeadlineCancelJob (D-02/D-07/D-09, CHAL-06 deadline path)', () => {
   let job: DeadlineCancelJob;
-  let paymentsService: { processDeadline: jest.Mock };
+  let paymentsService: { processDeadline: jest.Mock; activateIfDue: jest.Mock };
   let prisma: { challenge: { findMany: jest.Mock } };
 
   const expiredChallenge = { id: 'challenge-1' };
 
   beforeEach(async () => {
-    paymentsService = { processDeadline: jest.fn() };
+    paymentsService = {
+      processDeadline: jest.fn(),
+      // Data de início (feedback): sweep extra de desafios cuja `starts_at` já
+      // chegou. Sem candidatos due por padrão para não poluir as asserções de
+      // processDeadline; o teste dedicado abaixo cobre o caminho de ativação.
+      activateIfDue: jest.fn().mockResolvedValue({ action: 'none' }),
+    };
 
     prisma = {
       challenge: {
-        findMany: jest.fn().mockResolvedValue([expiredChallenge]),
+        // 1ª chamada = sweep de expirados (3 dias); 2ª = sweep de data de
+        // início. Default: expirados retorna o challenge, due retorna vazio.
+        findMany: jest
+          .fn()
+          .mockResolvedValueOnce([expiredChallenge])
+          .mockResolvedValue([]),
       },
     };
 
@@ -181,6 +192,29 @@ describe('DeadlineCancelJob (D-02/D-07/D-09, CHAL-06 deadline path)', () => {
     await job.run();
 
     expect(paymentsService.processDeadline).toHaveBeenCalledTimes(1);
+  });
+
+  it('activates challenges whose planned start date has arrived via activateIfDue (data de início, feedback)', async () => {
+    // No expired challenges; one whose starts_at is due.
+    prisma.challenge.findMany
+      .mockReset()
+      .mockResolvedValueOnce([]) // expired sweep
+      .mockResolvedValueOnce([{ id: 'challenge-due' }]); // due sweep
+    paymentsService.activateIfDue.mockResolvedValue({ action: 'activated' });
+
+    await job.run();
+
+    expect(paymentsService.processDeadline).not.toHaveBeenCalled();
+    expect(paymentsService.activateIfDue).toHaveBeenCalledWith('challenge-due');
+    // The due sweep queries WAITING challenges whose starts_at has passed.
+    expect(prisma.challenge.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: 'WAITING',
+          startsAt: expect.objectContaining({ lte: expect.any(Date) }),
+        }),
+      }),
+    );
   });
 });
 
