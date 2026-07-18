@@ -1,9 +1,20 @@
-import { Body, Controller, Get, HttpCode, Param, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { UserPayload } from '../auth/strategies/jwt.strategy';
 import { InvitesService } from './invites.service';
 import { AcceptAndPayDto } from './dto/accept-and-pay.dto';
+import { UpdateInviteDto } from './dto/update-invite.dto';
 
 @Controller('invites')
 export class InvitesController {
@@ -50,5 +61,33 @@ export class InvitesController {
     @CurrentUser() currentUser: UserPayload,
   ) {
     return this.invitesService.acceptAndPay(token, currentUser.id, dto.pixKey);
+  }
+
+  /**
+   * PATCH /invites/:id — creator edits a pending invite's target email and the
+   * invitation is re-dispatched to the new address (feedback QA 5a).
+   * Creator-only, PENDING-only (guards in InvitesService).
+   * NOTE: :id here is the invite's DB id, not the token.
+   */
+  @Patch(':id')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(200)
+  async updateInvite(
+    @Param('id') id: string,
+    @Body() dto: UpdateInviteDto,
+    @CurrentUser() currentUser: UserPayload,
+  ) {
+    return this.invitesService.updateEmail(id, currentUser.id, dto.targetEmail);
+  }
+
+  /**
+   * DELETE /invites/:id — creator removes a pending invite (feedback QA 5a).
+   * Creator-only, PENDING-only. :id is the invite's DB id, not the token.
+   */
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(200)
+  async removeInvite(@Param('id') id: string, @CurrentUser() currentUser: UserPayload) {
+    return this.invitesService.remove(id, currentUser.id);
   }
 }
