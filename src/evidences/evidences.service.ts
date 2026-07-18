@@ -11,16 +11,13 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '../generated/prisma/client.js';
 import { IObjectStorage, UploadUrlResult } from '../storage/interfaces/object-storage.interface';
-import { saoPauloDay } from '../common/utils/sao-paulo-day.util';
+import { saoPauloDay, saoPauloEndOfDay } from '../common/utils/sao-paulo-day.util';
 
 export interface PresignUploadResult {
   uploadUrl: string;
   objectKey: string;
   expiresAt: Date;
 }
-
-// D-07: the vote window is a full 24h, anchored to the evidence's post time.
-const VOTE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class EvidencesService {
@@ -134,7 +131,12 @@ export class EvidencesService {
       throw new ConflictException('Você já postou a evidência de hoje.');
     }
 
-    const windowClosesAt = new Date(Date.now() + VOTE_WINDOW_MS);
+    // Item G: the vote window for an evidence closes at 23:59:59.999 SP of its
+    // OWN calendar day, not a rolling 24h. vote-close.job resolves any evidence
+    // whose windowClosesAt <= now (unchanged), so aligning the boundary to the
+    // end of the SP day makes stale evidences resolve same-day → ranking shows
+    // ✓/✗ instead of ⏳ (item J is a consequence of this).
+    const windowClosesAt = saoPauloEndOfDay(evidenceDate);
 
     try {
       const evidence = await this.prisma.evidence.create({

@@ -29,6 +29,7 @@ export interface VotableEvidence {
   windowClosesAt: Date;
   status: string;
   hasVoted: boolean;
+  myVote: VoteValue | null;
 }
 
 @Injectable()
@@ -89,6 +90,24 @@ export class VotingService {
       }
       throw err;
     }
+
+    // Item G (early-close): if every eligible voter (PAID, excluding the author)
+    // has now voted, resolve the evidence immediately instead of waiting for the
+    // 23:59 cron. resolveEvidence is idempotent (atomic updateMany where status
+    // = PENDING inside a $transaction, T-otp-04), so a concurrent cron tick is a
+    // safe no-op.
+    const eligibleVoters = await this.prisma.participant.count({
+      where: {
+        challengeId: evidence.challengeId,
+        status: 'PAID',
+        id: { not: evidence.participantId },
+      },
+    });
+    const voteCount = await this.prisma.vote.count({ where: { evidenceId } });
+
+    if (eligibleVoters > 0 && voteCount >= eligibleVoters) {
+      await this.resolveEvidence(evidenceId);
+    }
   }
 
   /**
@@ -110,7 +129,7 @@ export class VotingService {
       },
       include: {
         participant: { include: { user: true } },
-        votes: { where: { voterId: participant.id }, select: { id: true } },
+        votes: { where: { voterId: participant.id }, select: { value: true } },
       },
       orderBy: { postedAt: 'asc' },
     });
@@ -122,6 +141,10 @@ export class VotingService {
       windowClosesAt: evidence.windowClosesAt,
       status: evidence.status,
       hasVoted: evidence.votes.length > 0,
+      // Item I: expose HOW the caller voted so the badge can render green (SIM)
+      // vs coral (NAO). Only the caller's own vote is included (Info Disclosure
+      // mitigation preserved — still no tally of others' votes).
+      myVote: (evidence.votes[0]?.value as VoteValue | undefined) ?? null,
     }));
   }
 

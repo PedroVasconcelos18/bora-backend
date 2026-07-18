@@ -20,3 +20,16 @@ const SP_DAY_FORMATTER = new Intl.DateTimeFormat('en-CA', {
 export function saoPauloDay(date: Date = new Date()): string {
   return SP_DAY_FORMATTER.format(date);
 }
+
+/**
+ * Returns the exact instant of 23:59:59.999 in America/Sao_Paulo for the given
+ * 'YYYY-MM-DD' calendar day. This is the vote-window close for an evidence
+ * posted on `dayStr` (item G — cada evidência fecha às 23:59 SP do próprio dia).
+ *
+ * Uses the fixed -03:00 offset: Brazil has had no DST since 2019, so SP is a
+ * constant UTC-3 and the offset is unambiguous for this end-of-day boundary
+ * (e.g. 2026-07-18 -> 2026-07-19T02:59:59.999Z).
+ */
+export function saoPauloEndOfDay(dayStr: string): Date {
+  return new Date(`${dayStr}T23:59:59.999-03:00`);
+}

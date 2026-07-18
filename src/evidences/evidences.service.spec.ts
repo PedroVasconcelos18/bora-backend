@@ -5,6 +5,7 @@ import { EvidencesService } from './evidences.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { IObjectStorage } from '../storage/interfaces/object-storage.interface';
 import { Prisma } from '../generated/prisma/client.js';
+import { saoPauloDay, saoPauloEndOfDay } from '../common/utils/sao-paulo-day.util';
 
 describe('EvidencesService (EVID-01/02/03)', () => {
   let service: EvidencesService;
@@ -168,6 +169,29 @@ describe('EvidencesService (EVID-01/02/03)', () => {
         participantId: paidParticipant.id,
         challengeId,
       });
+    });
+
+    it('sets windowClosesAt to 23:59:59.999 SP of the evidence day, not postedAt + 24h (item G)', async () => {
+      prisma.evidence.create.mockResolvedValueOnce({
+        id: 'evidence-1',
+        challengeId,
+        participantId: paidParticipant.id,
+      });
+      objectStorage.getUploadUrl.mockImplementation(async ({ key }) => ({
+        uploadUrl: 'https://r2.example.com/signed-put',
+        objectKey: key,
+        expiresAt: new Date(),
+      }));
+      const { objectKey } = await service.presignUpload(userId, challengeId, 'image/jpeg');
+
+      await service.confirmEvidence(userId, challengeId, objectKey);
+
+      const expectedClose = saoPauloEndOfDay(saoPauloDay());
+      expect(prisma.evidence.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ windowClosesAt: expectedClose }),
+        }),
+      );
     });
   });
 });
