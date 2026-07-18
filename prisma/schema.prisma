@@ -18,7 +18,12 @@ model User {
   name                String
   passwordHash        String                @map("password_hash")
   createdAt           DateTime              @default(now()) @map("created_at")
+  // Legacy single "primary" Pix key — kept in sync with pixKeys[0] so the
+  // payout/refund fallback (participant.pixKey ?? user.pixKey) is untouched.
   pixKey              String?               @map("pix_key")
+  // Up to 5 saved Pix keys (feedback: múltiplas chaves). Source of truth for
+  // the profile editor + the pay-time dropdown; pixKey mirrors the first one.
+  pixKeys             String[]              @default([]) @map("pix_keys")
   refreshTokens       RefreshToken[]
   passwordResetTokens PasswordResetToken[]
   participants        Participant[]
