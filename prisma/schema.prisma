@@ -119,6 +119,7 @@ model Payment {
   createdAt         DateTime      @default(now()) @map("created_at")
   paidAt            DateTime?     @map("paid_at")
   refundedAt        DateTime?     @map("refunded_at")
+  refundReason      String?       @map("refund_reason")
   pixKey            String?       @map("pix_key")
 
   @@index([status])
