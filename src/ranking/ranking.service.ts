@@ -62,8 +62,17 @@ export class RankingService {
 
     const collabAmount = Number(challenge.collabAmount);
     const platformFee = Number(challenge.platformFee);
-    const paidCount = challenge.participants.length;
-    const prizeValue = Math.max(0, collabAmount * paidCount - platformFee);
+    // Item F: the prize base is the FULL roster (participants + pending invites),
+    // NOT just who paid — this mirrors ParticipantsService.getWaitingRoomStatus's
+    // expectedCount so the value shown in card, waiting room, detail header and
+    // ranking is always identical. (Only PAID participants above are *ranked*;
+    // the prize amount is derived from the whole turma.)
+    const totalParticipants = await this.prisma.participant.count({ where: { challengeId } });
+    const pendingInvites = await this.prisma.invite.count({
+      where: { challengeId, status: 'PENDING' },
+    });
+    const rosterCount = totalParticipants + pendingInvites;
+    const prizeValue = Math.max(0, collabAmount * rosterCount - platformFee);
 
     const validatedCounts = await this.prisma.evidence.groupBy({
       by: ['participantId'],
