@@ -47,7 +47,7 @@ describe('PaymentsService', () => {
       status: 'WAITING',
       collabAmount: 25 as unknown as number,
     },
-    user: { id: 'user-1', email: 'joao@example.com', name: 'João', pixKey: null },
+    user: { id: 'user-1', email: 'joao@example.com', name: 'João', pixKey: null, pixKeys: [] },
   };
 
   const webhookSecret = 'test-webhook-secret-fixture';
@@ -168,14 +168,14 @@ describe('PaymentsService', () => {
 
       expect(prisma.user.update).toHaveBeenCalledWith({
         where: { id: 'user-1' },
-        data: { pixKey: 'joao@pix' },
+        data: { pixKey: 'joao@pix', pixKeys: ['joao@pix'] },
       });
     });
 
     it('does NOT backfill the profile key when the paying user already has one', async () => {
       prisma.participant.findUnique.mockResolvedValueOnce({
         ...waitingParticipant,
-        user: { ...waitingParticipant.user, pixKey: 'existing@pix' },
+        user: { ...waitingParticipant.user, pixKey: 'existing@pix', pixKeys: ['existing@pix'] },
       });
 
       await service.createCashIn('participant-1', 'new@pix');
