@@ -27,9 +27,12 @@ export class ProfileController {
     return this.profileService.getProfile(user.id);
   }
 
-  /** PATCH /profile — trims and persists the caller's own Pix key (D-4). */
+  /** PATCH /profile — persists the caller's own Pix keys (up to 5, D-4). */
   @Patch()
-  async updatePixKey(@Body() dto: UpdateProfileDto, @CurrentUser() user: UserPayload) {
-    return this.profileService.updatePixKey(user.id, dto.pixKey);
+  async updatePixKeys(@Body() dto: UpdateProfileDto, @CurrentUser() user: UserPayload) {
+    // Prefer the new list shape; fall back to the legacy single `pixKey` so an
+    // older client still works (wrapped into a one-element list).
+    const keys = dto.pixKeys ?? (dto.pixKey !== undefined ? [dto.pixKey] : []);
+    return this.profileService.updatePixKeys(user.id, keys);
   }
 }
