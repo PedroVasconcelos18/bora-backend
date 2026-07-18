@@ -9,7 +9,7 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
   let service: VotingService;
   let eventEmitter: { emit: jest.Mock };
   let prisma: {
-    evidence: { findUnique: jest.Mock; updateMany: jest.Mock };
+    evidence: { findUnique: jest.Mock; updateMany: jest.Mock; findMany: jest.Mock };
     participant: { findUnique: jest.Mock; count: jest.Mock };
     vote: { create: jest.Mock; count: jest.Mock };
     $transaction: jest.Mock;
@@ -37,6 +37,7 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
       evidence: {
         findUnique: jest.fn().mockResolvedValue(openEvidence),
         updateMany: jest.fn(),
+        findMany: jest.fn(),
       },
       participant: {
         findUnique: jest.fn().mockResolvedValue(voterParticipant),
@@ -102,6 +103,59 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
       await expect(service.castVote(userId, evidenceId, 'SIM')).rejects.toThrow(ConflictException);
       expect(prisma.vote.create).toHaveBeenCalledTimes(2);
     });
+
+    it('early-close (item G): resolves the evidence immediately once every eligible voter has voted', async () => {
+      prisma.participant.count.mockResolvedValueOnce(1); // castVote: eligibleVoters
+      prisma.vote.count.mockResolvedValueOnce(1); // castVote: total votes so far
+      // resolveEvidence re-counts inside its $transaction:
+      prisma.participant.count.mockResolvedValueOnce(1); // resolve: eligibleVoters
+      prisma.vote.count.mockResolvedValueOnce(0); // resolve: explicit NAO
+      prisma.evidence.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.castVote(userId, evidenceId, 'SIM');
+
+      expect(prisma.evidence.updateMany).toHaveBeenCalledWith({
+        where: { id: evidenceId, status: 'PENDING' },
+        data: { status: 'ACCEPTED', resolvedAt: expect.any(Date) },
+      });
+    });
+
+    it('early-close (item G): does NOT resolve while eligible voters still have not voted', async () => {
+      prisma.participant.count.mockResolvedValueOnce(3); // eligibleVoters
+      prisma.vote.count.mockResolvedValueOnce(1); // only 1 of 3 has voted
+
+      await service.castVote(userId, evidenceId, 'SIM');
+
+      expect(prisma.evidence.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listVotableEvidences (item I — myVote)', () => {
+    const base = {
+      id: evidenceId,
+      participant: { user: { name: 'Amiga' } },
+      objectKey: 'evidences/challenge-1/participant-author/2026-07-18.jpg',
+      windowClosesAt: new Date(),
+      status: 'PENDING',
+    };
+
+    it('exposes myVote as the caller vote value when the caller already voted', async () => {
+      prisma.evidence.findMany.mockResolvedValueOnce([{ ...base, votes: [{ value: 'NAO' }] }]);
+
+      const result = await service.listVotableEvidences(userId, challengeId);
+
+      expect(result[0].myVote).toBe('NAO');
+      expect(result[0].hasVoted).toBe(true);
+    });
+
+    it('exposes myVote as null when the caller has not voted', async () => {
+      prisma.evidence.findMany.mockResolvedValueOnce([{ ...base, votes: [] }]);
+
+      const result = await service.listVotableEvidences(userId, challengeId);
+
+      expect(result[0].myVote).toBeNull();
+      expect(result[0].hasVoted).toBe(false);
+    });
   });
 
   describe('resolveEvidence', () => {
@@ -137,6 +191,30 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
         challengeId: pendingEvidence.challengeId,
         outcome: 'accepted',
       });
+    });
+
+    it('H (empate=feito, já implementado em voting.service.ts): a strict tie resolves ACCEPTED (eligibleVoters == 2*explicitNao)', async () => {
+      prisma.evidence.findUnique.mockResolvedValueOnce(pendingEvidence);
+      prisma.participant.count.mockResolvedValueOnce(2); // eligibleVoters
+      prisma.vote.count.mockResolvedValueOnce(1); // explicit NAO → 2 >= 2*1 (tie)
+      prisma.evidence.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      const result = await service.resolveEvidence(evidenceId);
+
+      expect(result).toBe('accepted');
+    });
+
+    it('J (consequência de G): a resolved evidence leaves PENDING (ACCEPTED/REJECTED) so the ranking shows ✓/✗ instead of ⏳', async () => {
+      prisma.evidence.findUnique.mockResolvedValueOnce(pendingEvidence);
+      prisma.participant.count.mockResolvedValueOnce(2);
+      prisma.vote.count.mockResolvedValueOnce(0);
+      prisma.evidence.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.resolveEvidence(evidenceId);
+
+      const writtenStatus = prisma.evidence.updateMany.mock.calls[0][0].data.status;
+      expect(writtenStatus).not.toBe('PENDING');
+      expect(['ACCEPTED', 'REJECTED']).toContain(writtenStatus);
     });
 
     it('rejects when eligibleVoters < 2 * explicitNao (2 < 2*2)', async () => {
