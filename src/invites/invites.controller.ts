@@ -81,6 +81,19 @@ export class InvitesController {
   }
 
   /**
+   * POST /invites/:id/resend — creator re-dispatches a pending invite to the
+   * SAME email (feedback: "botão para reenviar o convite"). Creator-only,
+   * PENDING-only. Does not mutate targetEmail — reuses the existing token so
+   * the link stays valid. :id is the invite's DB id, not the token.
+   */
+  @Post(':id/resend')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(200)
+  async resendInvite(@Param('id') id: string, @CurrentUser() currentUser: UserPayload) {
+    return this.invitesService.resend(id, currentUser.id);
+  }
+
+  /**
    * DELETE /invites/:id — creator removes a pending invite (feedback QA 5a).
    * Creator-only, PENDING-only. :id is the invite's DB id, not the token.
    */

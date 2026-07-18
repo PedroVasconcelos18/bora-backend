@@ -90,4 +90,16 @@ export class ChallengesController {
   async cancel(@Param('id') id: string, @CurrentUser() user: UserPayload) {
     return this.challengesService.cancel(id, user.id);
   }
+
+  /**
+   * PATCH /challenges/:id/start — creator-only "começar agora" (feedback).
+   * Starts a WAITING challenge before its planned start date once every
+   * participant has paid and no invites are pending. Guards + friendly errors
+   * live in ChallengesService.startNow.
+   */
+  @Patch(':id/start')
+  @HttpCode(200)
+  async start(@Param('id') id: string, @CurrentUser() user: UserPayload) {
+    return this.challengesService.startNow(id, user.id);
+  }
 }

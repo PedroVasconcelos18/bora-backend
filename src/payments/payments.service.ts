@@ -269,11 +269,19 @@ export class PaymentsService {
    * effects exactly once).
    */
   async tryActivateChallenge(tx: Prisma.TransactionClient, challengeId: string): Promise<boolean> {
+    // Data de início planejada (CHAL — feedback): quando o criador escolheu uma
+    // data (`starts_at` gravado na criação), a ativação automática só acontece a
+    // partir dela — antes disso o desafio fica EM ESPERA mesmo com a turma paga
+    // (o criador antecipa pelo botão "começar agora"). Sem data escolhida
+    // (`starts_at IS NULL`) segue o comportamento antigo: ativa assim que paga.
+    // `COALESCE(starts_at, NOW())` preserva a data planejada como início real
+    // (a matemática de ranking/finalização conta a partir de `starts_at`).
     const rowsChanged = await tx.$executeRaw`
       UPDATE challenges
-      SET status = 'ACTIVE', starts_at = NOW()
+      SET status = 'ACTIVE', starts_at = COALESCE(starts_at, NOW())
       WHERE id = ${challengeId}
         AND status = 'WAITING'
+        AND (starts_at IS NULL OR starts_at <= NOW())
         AND (
           SELECT COUNT(*) FROM participants
           WHERE challenge_id = ${challengeId} AND status = 'PAID'
@@ -285,6 +293,92 @@ export class PaymentsService {
     }
 
     return rowsChanged === 1;
+  }
+
+  /**
+   * Activate a challenge whose planned start date has arrived (the cron's
+   * date-arrival sweep). Reuses the exact same atomic conditional UPDATE as
+   * the webhook path — the `starts_at <= NOW()` guard is already baked into
+   * `tryActivateChallenge`, so this only flips challenges that are due AND
+   * have >=3 paid. Fully idempotent (no-op once no longer WAITING). Emits
+   * `challenge.activated` post-commit, exactly like the deadline path.
+   */
+  async activateIfDue(challengeId: string): Promise<DeadlineResult> {
+    const activated = await this.prisma.$transaction(async (tx) => {
+      const challenge = await tx.challenge.findUnique({
+        where: { id: challengeId },
+        select: { status: true },
+      });
+      if (!challenge || challenge.status !== 'WAITING') {
+        return false;
+      }
+      return this.tryActivateChallenge(tx, challengeId);
+    });
+
+    if (activated) {
+      this.eventEmitter.emit('challenge.activated', { challengeId });
+      this.logger.log(`activateIfDue: challenge ${challengeId} activated at its planned start date`);
+      return { action: 'activated' };
+    }
+
+    return { action: 'none' };
+  }
+
+  /**
+   * Creator's "começar agora" manual activation (feedback): start the
+   * challenge before its planned start date once the group is settled.
+   *
+   * Atomic pré-conditions (source of truth — the frontend mirrors these as
+   * `canStartNow`): the challenge is still WAITING, there are NO pending
+   * invites left, there are at least 2 participants, and EVERY participant is
+   * PAID. Unlike the automatic path this does NOT require >=3 paid (the
+   * creator explicitly removed the 3-person floor for this button), but it
+   * DOES require everyone in to have paid so nobody is locked out of an
+   * ACTIVE challenge. Overrides `starts_at = NOW()` — the manual start moment
+   * becomes the real start date.
+   */
+  async startNowActivate(challengeId: string): Promise<{ started: boolean }> {
+    const started = await this.prisma.$transaction(async (tx) => {
+      const challenge = await tx.challenge.findUnique({
+        where: { id: challengeId },
+        select: { status: true },
+      });
+      if (!challenge || challenge.status !== 'WAITING') {
+        return false;
+      }
+
+      const pendingInvites = await tx.invite.count({
+        where: { challengeId, status: 'PENDING' },
+      });
+      if (pendingInvites > 0) {
+        return false;
+      }
+
+      const participants = await tx.participant.findMany({
+        where: { challengeId },
+        select: { status: true },
+      });
+      const everyonePaid =
+        participants.length >= 2 && participants.every((p) => p.status === 'PAID');
+      if (!everyonePaid) {
+        return false;
+      }
+
+      const rowsChanged = await tx.$executeRaw`
+        UPDATE challenges
+        SET status = 'ACTIVE', starts_at = NOW()
+        WHERE id = ${challengeId}
+          AND status = 'WAITING'
+      `;
+      return rowsChanged === 1;
+    });
+
+    if (started) {
+      this.eventEmitter.emit('challenge.activated', { challengeId });
+      this.logger.log(`startNowActivate: challenge ${challengeId} manually started by creator`);
+    }
+
+    return { started };
   }
 
   /**
@@ -351,6 +445,14 @@ export class PaymentsService {
 
       if (challenge.status !== 'WAITING') {
         // Idempotent no-op — already resolved by a prior run or the webhook path.
+        return { action: 'none' as const };
+      }
+
+      // Data de início planejada ainda no futuro: NÃO cancelar no fim da janela
+      // de 3 dias — o criador escolheu começar mais pra frente. A resolução
+      // (ativar/cancelar) é adiada para a data de início (via activateIfDue e
+      // as próximas passadas deste cron, quando `starts_at <= now`).
+      if (challenge.startsAt && challenge.startsAt.getTime() > Date.now()) {
         return { action: 'none' as const };
       }
 

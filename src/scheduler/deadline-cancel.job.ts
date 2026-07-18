@@ -48,8 +48,22 @@ export class DeadlineCancelJob {
       if (result.action === 'cancelled') cancelled++;
     }
 
+    // Data de início planejada (feedback): desafios cuja `starts_at` já chegou
+    // e que têm turma paga (>=3) precisam ativar mesmo antes da janela de 3
+    // dias fechar — o sweep acima só pega os expirados. `activateIfDue` reusa o
+    // mesmo UPDATE condicional (idempotente; no-op se <3 pagos ou já ativo).
+    const due = await this.prisma.challenge.findMany({
+      where: { status: 'WAITING', startsAt: { lte: new Date() } },
+      select: { id: true },
+    });
+
+    for (const challenge of due) {
+      const result = await this.paymentsService.activateIfDue(challenge.id);
+      if (result.action === 'activated') activated++;
+    }
+
     this.logger.log(
-      `deadline-cancel: found=${expired.length} activated=${activated} cancelled=${cancelled} at=${new Date().toISOString()}`,
+      `deadline-cancel: expired=${expired.length} due=${due.length} activated=${activated} cancelled=${cancelled} at=${new Date().toISOString()}`,
     );
   }
 }
