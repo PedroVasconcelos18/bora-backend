@@ -41,6 +41,38 @@ describe('AdminService (D-2/T-i98 pixKey fallback chain)', () => {
       expect(result[0].pixKey).toBe('participant@pix');
     });
 
+    it('exposes the persisted refundReason as reason (item C)', async () => {
+      prisma.payment.findMany.mockResolvedValueOnce([
+        {
+          id: 'payment-1',
+          amount: '25.00',
+          refundReason: 'Desafio cancelado pelo criador.',
+          challenge: { title: 'Corrida' },
+          participant: { pixKey: 'participant@pix', user: { name: 'João', pixKey: 'profile@pix' } },
+        },
+      ]);
+
+      const result = await service.listRefunds();
+
+      expect(result[0].reason).toBe('Desafio cancelado pelo criador.');
+    });
+
+    it('exposes reason as null when no refundReason was persisted', async () => {
+      prisma.payment.findMany.mockResolvedValueOnce([
+        {
+          id: 'payment-1',
+          amount: '25.00',
+          refundReason: null,
+          challenge: { title: 'Corrida' },
+          participant: { pixKey: 'participant@pix', user: { name: 'João', pixKey: 'profile@pix' } },
+        },
+      ]);
+
+      const result = await service.listRefunds();
+
+      expect(result[0].reason).toBeNull();
+    });
+
     it("falls back to the participant's user profile pixKey when participant.pixKey is null", async () => {
       prisma.payment.findMany.mockResolvedValueOnce([
         {

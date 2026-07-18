@@ -423,7 +423,31 @@ describe('PaymentsService', () => {
       });
       expect(tx.payment.updateMany).toHaveBeenCalledWith({
         where: { challengeId: 'challenge-1', status: 'APPROVED' },
-        data: { status: 'REFUND_PENDING' },
+        data: { status: 'REFUND_PENDING', refundReason: 'Desafio cancelado pelo criador.' },
+      });
+    });
+
+    it('persists the deadline default refundReason for the deadline-sweep path (item C)', async () => {
+      await service.cancelChallenge('challenge-1', 'deadline');
+
+      expect(tx.payment.updateMany).toHaveBeenCalledWith({
+        where: { challengeId: 'challenge-1', status: 'APPROVED' },
+        data: {
+          status: 'REFUND_PENDING',
+          refundReason: 'Prazo de pagamento expirou sem a turma completa.',
+        },
+      });
+    });
+
+    it('persists a custom refundReason verbatim when provided (item C)', async () => {
+      await service.cancelChallenge('challenge-1', 'manual', 'A turma ficou com menos de 3 pessoas.');
+
+      expect(tx.payment.updateMany).toHaveBeenCalledWith({
+        where: { challengeId: 'challenge-1', status: 'APPROVED' },
+        data: {
+          status: 'REFUND_PENDING',
+          refundReason: 'A turma ficou com menos de 3 pessoas.',
+        },
       });
     });
 
@@ -503,7 +527,10 @@ describe('PaymentsService', () => {
       });
       expect(tx.payment.updateMany).toHaveBeenCalledWith({
         where: { challengeId: 'challenge-1', status: 'APPROVED' },
-        data: { status: 'REFUND_PENDING' },
+        data: {
+          status: 'REFUND_PENDING',
+          refundReason: 'Prazo de pagamento expirou sem a turma completa.',
+        },
       });
     });
 

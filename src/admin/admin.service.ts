@@ -7,6 +7,7 @@ export interface RefundQueueRow {
   participantName: string;
   amount: string;
   pixKey: string | null;
+  reason: string | null;
 }
 
 export interface MarkRefundedResult {
@@ -57,6 +58,7 @@ export class AdminService {
       participantName: payment.participant.user.name,
       amount: payment.amount.toString(),
       pixKey: payment.participant.pixKey ?? payment.participant.user.pixKey,
+      reason: payment.refundReason,
     }));
   }
 
