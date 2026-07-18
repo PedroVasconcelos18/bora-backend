@@ -92,10 +92,13 @@ export class PaymentsService {
         data: { pixKey: trimmedKey },
       });
 
-      if (!participant.user.pixKey) {
+      // Backfill only when the user has NO saved keys yet — seeds both the
+      // list (source of truth) and the legacy primary mirror. A user who
+      // already has keys picked one from the dropdown, so nothing to add.
+      if (!participant.user.pixKey && participant.user.pixKeys.length === 0) {
         await this.prisma.user.update({
           where: { id: participant.userId },
-          data: { pixKey: trimmedKey },
+          data: { pixKey: trimmedKey, pixKeys: [trimmedKey] },
         });
       }
     }
