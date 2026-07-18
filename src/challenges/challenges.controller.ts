@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   NotFoundException,
@@ -101,5 +102,20 @@ export class ChallengesController {
   @HttpCode(200)
   async start(@Param('id') id: string, @CurrentUser() user: UserPayload) {
     return this.challengesService.startNow(id, user.id);
+  }
+
+  /**
+   * DELETE /challenges/:challengeId/participants/:participantId — creator-only
+   * removal of an accepted-but-unpaid participant while WAITING (item B).
+   * Guards + friendly errors live in ChallengesService.removeParticipant.
+   */
+  @Delete(':challengeId/participants/:participantId')
+  @HttpCode(200)
+  async removeParticipant(
+    @Param('challengeId') challengeId: string,
+    @Param('participantId') participantId: string,
+    @CurrentUser() user: UserPayload,
+  ) {
+    return this.challengesService.removeParticipant(challengeId, participantId, user.id);
   }
 }

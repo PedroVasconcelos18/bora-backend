@@ -262,4 +262,92 @@ export class ChallengesService {
 
     return { status: 'ACTIVE' };
   }
+
+  /**
+   * Creator removes an accepted-but-unpaid participant while the challenge is
+   * still WAITING (item B, decisão travada 1). Guards:
+   * - only the creator (T-otp-01);
+   * - only in WAITING (participação vira compromisso após ACTIVE);
+   * - the participant must belong to this challenge (T-otp-02);
+   * - never the creator's own row, never someone who already paid (409).
+   *
+   * On success: deletes the participant's non-APPROVED payments (avoids FK
+   * violation), deletes the Participant, and EXPIRES the matching ACCEPTED
+   * invite. If the roster drops below 3, the challenge is cancelled and any
+   * APPROVED payment moves to REFUND_PENDING with a legible motive (reuses
+   * PaymentsService.cancelChallenge).
+   */
+  async removeParticipant(
+    challengeId: string,
+    participantId: string,
+    callerId: string,
+  ): Promise<{ removed: true; challengeCancelled: boolean; remainingParticipants: number }> {
+    const challenge = await this.prisma.challenge.findUnique({
+      where: { id: challengeId },
+    });
+
+    if (!challenge) {
+      throw new NotFoundException('Desafio não encontrado.');
+    }
+
+    if (challenge.creatorId !== callerId) {
+      throw new ForbiddenException('Apenas o criador pode remover participantes.');
+    }
+
+    if (challenge.status !== 'WAITING') {
+      throw new ConflictException(
+        'Só é possível remover participantes enquanto o desafio está aguardando turma.',
+      );
+    }
+
+    const participant = await this.prisma.participant.findUnique({
+      where: { id: participantId },
+      include: { user: true, payments: true },
+    });
+
+    if (!participant || participant.challengeId !== challengeId) {
+      throw new NotFoundException('Participante não encontrado neste desafio.');
+    }
+
+    if (participant.userId === challenge.creatorId) {
+      throw new ConflictException('O criador não pode se remover do desafio.');
+    }
+
+    const hasApprovedPayment = participant.payments.some((p) => p.status === 'APPROVED');
+    if (participant.status === 'PAID' || hasApprovedPayment) {
+      throw new ConflictException('Não é possível remover quem já pagou.');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.payment.deleteMany({
+        where: { participantId, status: { not: 'APPROVED' } },
+      });
+
+      await tx.participant.delete({ where: { id: participantId } });
+
+      await tx.invite.updateMany({
+        where: {
+          challengeId,
+          targetEmail: participant.user.email.toLowerCase(),
+          status: 'ACCEPTED',
+        },
+        data: { status: 'EXPIRED' },
+      });
+    });
+
+    const remainingParticipants = await this.prisma.participant.count({
+      where: { challengeId },
+    });
+
+    if (remainingParticipants < 3) {
+      await this.paymentsService.cancelChallenge(
+        challengeId,
+        'manual',
+        'A turma ficou com menos de 3 pessoas após a remoção de um participante.',
+      );
+      return { removed: true, challengeCancelled: true, remainingParticipants };
+    }
+
+    return { removed: true, challengeCancelled: false, remainingParticipants };
+  }
 }
