@@ -25,7 +25,7 @@ export class CreateChallengeDto {
   durationDays!: number;
 
   @IsNumber()
-  @Min(5, { message: 'A colaboração mínima é R$ 5.' })
+  @Min(10, { message: 'A colaboração mínima é R$ 10.' })
   @Max(200, { message: 'A colaboração máxima é R$ 200.' })
   @Transform(({ value }: { value: unknown }) => Number(value))
   collabAmount!: number;

@@ -59,8 +59,8 @@ describe('CreateChallengeDto — durationDays', () => {
 });
 
 describe('CreateChallengeDto — collabAmount', () => {
-  it('R$ 5 é válido (piso)', async () => {
-    const errors = await validatePayload({ collabAmount: 5 });
+  it('R$ 10 é válido (piso)', async () => {
+    const errors = await validatePayload({ collabAmount: 10 });
     expect(errors).toHaveLength(0);
   });
 
@@ -69,8 +69,12 @@ describe('CreateChallengeDto — collabAmount', () => {
     expect(errors).toHaveLength(0);
   });
 
+  it('R$ 9 é rejeitado com mensagem pt-BR de mínimo', async () => {
+    await expectErrorMessage({ collabAmount: 9 }, 'A colaboração mínima é R$ 10.');
+  });
+
   it('R$ 4 é rejeitado com mensagem pt-BR de mínimo', async () => {
-    await expectErrorMessage({ collabAmount: 4 }, 'A colaboração mínima é R$ 5.');
+    await expectErrorMessage({ collabAmount: 4 }, 'A colaboração mínima é R$ 10.');
   });
 
   it('R$ 201 é rejeitado com mensagem pt-BR de máximo', async () => {
@@ -78,7 +82,7 @@ describe('CreateChallengeDto — collabAmount', () => {
   });
 
   it('-R$ 50 é rejeitado com mensagem pt-BR de mínimo', async () => {
-    await expectErrorMessage({ collabAmount: -50 }, 'A colaboração mínima é R$ 5.');
+    await expectErrorMessage({ collabAmount: -50 }, 'A colaboração mínima é R$ 10.');
   });
 });
 
