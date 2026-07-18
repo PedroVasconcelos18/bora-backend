@@ -9,6 +9,8 @@ describe('RankingService (RANK-01/02/03/04)', () => {
   let prisma: {
     challenge: { findUnique: jest.Mock };
     evidence: { groupBy: jest.Mock };
+    participant: { count: jest.Mock };
+    invite: { count: jest.Mock };
   };
 
   const challengeId = 'challenge-1';
@@ -17,6 +19,9 @@ describe('RankingService (RANK-01/02/03/04)', () => {
     prisma = {
       challenge: { findUnique: jest.fn() },
       evidence: { groupBy: jest.fn() },
+      // Item F: prize base = full roster (participants + pending invites).
+      participant: { count: jest.fn().mockResolvedValue(0) },
+      invite: { count: jest.fn().mockResolvedValue(0) },
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -48,13 +53,42 @@ describe('RankingService (RANK-01/02/03/04)', () => {
       ],
     });
     prisma.evidence.groupBy.mockResolvedValueOnce([{ participantId: 'p1', _count: 3 }]);
+    prisma.participant.count.mockResolvedValueOnce(2); // rosterCount
+    prisma.invite.count.mockResolvedValueOnce(0); // no pending invites
 
     const result = await service.getRanking(challengeId);
 
-    // prize = paidCount(2) * collabAmount(20) - platformFee(10), server-computed, never from the request.
+    // prize = rosterCount(2) * collabAmount(20) - platformFee(10), server-computed, never from the request.
     expect(result.prize).toBe('30.00');
     expect(result.participants.find((p) => p.id === 'p1')?.validatedDays).toBe(3);
     expect(result.participants.find((p) => p.id === 'p2')?.validatedDays).toBe(0);
+  });
+
+  it('bases the prize on the full roster (participants + pending invites), NOT just who paid (item F)', async () => {
+    const startsAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+
+    // Only 2 PAID participants are RANKED, but the roster is 3 participants + 1
+    // pending invite = 4 → prize = 4*20 - 10 = 70.00 (same base as sala de espera).
+    prisma.challenge.findUnique.mockResolvedValueOnce({
+      id: challengeId,
+      durationDays: 5,
+      collabAmount: 20,
+      platformFee: 10,
+      startsAt,
+      createdAt: startsAt,
+      participants: [
+        { id: 'p1', user: { name: 'Ana' }, evidences: [] },
+        { id: 'p2', user: { name: 'Beto' }, evidences: [] },
+      ],
+    });
+    prisma.evidence.groupBy.mockResolvedValueOnce([]);
+    prisma.participant.count.mockResolvedValueOnce(3); // includes 1 unpaid participant
+    prisma.invite.count.mockResolvedValueOnce(1); // 1 pending invite
+
+    const result = await service.getRanking(challengeId);
+
+    expect(result.prize).toBe('70.00');
+    expect(result.participants).toHaveLength(2); // only PAID rows are ranked
   });
 
   it('orders participants by validatedDays desc (RANK-01), independent of the input order', async () => {
