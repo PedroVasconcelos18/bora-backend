@@ -7,7 +7,30 @@ export interface ProfileStats {
 }
 
 export interface ProfilePixKey {
+  /** Legacy "primary" key = pixKeys[0] — kept for the payout/refund fallback. */
   pixKey: string | null;
+  /** All saved Pix keys (up to MAX_PIX_KEYS). */
+  pixKeys: string[];
+}
+
+/** Feedback: usuário pode cadastrar até 5 chaves Pix. */
+export const MAX_PIX_KEYS = 5;
+
+/**
+ * Normalize a raw list of Pix keys: trim each, drop blanks, dedupe (keeping
+ * first occurrence), and cap at MAX_PIX_KEYS. D-4 stays: trim-only, no
+ * CPF/email/phone format validation.
+ */
+export function normalizePixKeys(raw: string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const item of raw ?? []) {
+    const trimmed = (item ?? '').trim();
+    if (trimmed.length === 0) continue;
+    if (out.includes(trimmed)) continue;
+    out.push(trimmed);
+    if (out.length >= MAX_PIX_KEYS) break;
+  }
+  return out;
 }
 
 /**
@@ -39,20 +62,24 @@ export class ProfileService {
   async getProfile(userId: string): Promise<ProfilePixKey> {
     const row = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { pixKey: true },
+      select: { pixKey: true, pixKeys: true },
     });
-    return { pixKey: row?.pixKey ?? null };
+    return { pixKey: row?.pixKey ?? null, pixKeys: row?.pixKeys ?? [] };
   }
 
   /**
-   * PATCH /profile (D-4: trim-only, no format validation). A trimmed-empty
-   * value clears the key (stores null); a non-empty trimmed value is stored
-   * verbatim.
+   * PATCH /profile (D-4: trim-only, no format validation). Persists the full
+   * list of Pix keys (up to MAX_PIX_KEYS, deduped, blanks dropped) and mirrors
+   * the first one into the legacy `pixKey` column so the payout/refund
+   * fallback (participant.pixKey ?? user.pixKey) keeps working unchanged.
    */
-  async updatePixKey(userId: string, rawPixKey: string | undefined): Promise<ProfilePixKey> {
-    const trimmed = (rawPixKey ?? '').trim();
-    const value = trimmed.length > 0 ? trimmed : null;
-    await this.prisma.user.update({ where: { id: userId }, data: { pixKey: value } });
-    return { pixKey: value };
+  async updatePixKeys(userId: string, rawKeys: string[] | undefined): Promise<ProfilePixKey> {
+    const pixKeys = normalizePixKeys(rawKeys);
+    const primary = pixKeys[0] ?? null;
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { pixKeys, pixKey: primary },
+    });
+    return { pixKey: primary, pixKeys };
   }
 }

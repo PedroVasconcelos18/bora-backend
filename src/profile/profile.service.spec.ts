@@ -96,55 +96,56 @@ describe('ProfileService.getProfile/updatePixKey (T-i98-01, D-1/D-4)', () => {
     service = moduleRef.get(ProfileService);
   });
 
-  it("getProfile returns the row's pixKey, scoped to the caller's id", async () => {
-    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: 'joao@pix' });
+  it("getProfile returns the row's pixKey + pixKeys, scoped to the caller's id", async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: 'joao@pix', pixKeys: ['joao@pix'] });
 
     const result = await service.getProfile(userId);
 
-    expect(result).toEqual({ pixKey: 'joao@pix' });
+    expect(result).toEqual({ pixKey: 'joao@pix', pixKeys: ['joao@pix'] });
     expect(prisma.user.findUnique).toHaveBeenCalledWith({
       where: { id: userId },
-      select: { pixKey: true },
+      select: { pixKey: true, pixKeys: true },
     });
   });
 
-  it('getProfile returns { pixKey: null } when the user has no key set', async () => {
-    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: null });
+  it('getProfile returns empty when the user has no key set', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({ pixKey: null, pixKeys: [] });
 
     const result = await service.getProfile(userId);
 
-    expect(result).toEqual({ pixKey: null });
+    expect(result).toEqual({ pixKey: null, pixKeys: [] });
   });
 
-  it('updatePixKey trims surrounding whitespace before storing', async () => {
+  it('updatePixKeys trims, drops blanks, dedupes, and mirrors the first into pixKey', async () => {
     prisma.user.update.mockResolvedValueOnce({});
 
-    const result = await service.updatePixKey(userId, '  joao@pix  ');
+    const result = await service.updatePixKeys(userId, ['  joao@pix  ', '', 'joao@pix', '11987654321']);
 
-    expect(result).toEqual({ pixKey: 'joao@pix' });
+    expect(result).toEqual({ pixKey: 'joao@pix', pixKeys: ['joao@pix', '11987654321'] });
     expect(prisma.user.update).toHaveBeenCalledWith({
       where: { id: userId },
-      data: { pixKey: 'joao@pix' },
+      data: { pixKeys: ['joao@pix', '11987654321'], pixKey: 'joao@pix' },
     });
   });
 
-  it('updatePixKey stores null when the input is all-whitespace (clears the key)', async () => {
+  it('updatePixKeys clears everything when the list is empty (pixKey null)', async () => {
     prisma.user.update.mockResolvedValueOnce({});
 
-    const result = await service.updatePixKey(userId, '   ');
+    const result = await service.updatePixKeys(userId, ['   ', '']);
 
-    expect(result).toEqual({ pixKey: null });
+    expect(result).toEqual({ pixKey: null, pixKeys: [] });
     expect(prisma.user.update).toHaveBeenCalledWith({
       where: { id: userId },
-      data: { pixKey: null },
+      data: { pixKeys: [], pixKey: null },
     });
   });
 
-  it('updatePixKey stores a non-empty value unchanged (no format validation, D-4)', async () => {
+  it('updatePixKeys caps the list at 5 keys', async () => {
     prisma.user.update.mockResolvedValueOnce({});
 
-    const result = await service.updatePixKey(userId, '11987654321');
+    const result = await service.updatePixKeys(userId, ['a', 'b', 'c', 'd', 'e', 'f', 'g']);
 
-    expect(result).toEqual({ pixKey: '11987654321' });
+    expect(result.pixKeys).toEqual(['a', 'b', 'c', 'd', 'e']);
+    expect(result.pixKey).toBe('a');
   });
 });
