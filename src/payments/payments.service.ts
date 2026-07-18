@@ -391,7 +391,20 @@ export class PaymentsService {
    * (creator cancel endpoint, and later the deadline-sweep cron) both funnel
    * through this single method so the three consequences never drift apart.
    */
-  async cancelChallenge(challengeId: string, reason: 'manual' | 'deadline'): Promise<void> {
+  async cancelChallenge(
+    challengeId: string,
+    reason: 'manual' | 'deadline',
+    refundReason?: string,
+  ): Promise<void> {
+    // Human-readable pt-BR reason persisted onto each REFUND_PENDING payment so
+    // the admin queue (item C) shows WHY the money is owed back. Callers may pass
+    // an explicit `refundReason`; otherwise derive a sensible default per `reason`.
+    const resolvedRefundReason =
+      refundReason ??
+      (reason === 'deadline'
+        ? 'Prazo de pagamento expirou sem a turma completa.'
+        : 'Desafio cancelado pelo criador.');
+
     await this.prisma.$transaction(async (tx) => {
       await tx.challenge.update({
         where: { id: challengeId },
@@ -405,7 +418,7 @@ export class PaymentsService {
 
       await tx.payment.updateMany({
         where: { challengeId, status: 'APPROVED' },
-        data: { status: 'REFUND_PENDING' },
+        data: { status: 'REFUND_PENDING', refundReason: resolvedRefundReason },
       });
     });
 
