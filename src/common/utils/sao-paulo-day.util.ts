@@ -33,3 +33,21 @@ export function saoPauloDay(date: Date = new Date()): string {
 export function saoPauloEndOfDay(dayStr: string): Date {
   return new Date(`${dayStr}T23:59:59.999-03:00`);
 }
+
+/**
+ * Returns the exact instant of 00:00:00.000 in America/Sao_Paulo for the given
+ * 'YYYY-MM-DD' calendar day (e.g. 2026-07-29 -> 2026-07-29T03:00:00.000Z).
+ *
+ * Why this exists: `new Date('2026-07-29')` yields UTC midnight, which in SP is
+ * 21:00 of the PREVIOUS day. Persisting that as `Challenge.startsAt` made every
+ * SP-calendar derivation slip one day back — the ranking's day 1 landed on the
+ * eve of the start date (marked `falhou` for everyone, since nobody could have
+ * posted), the activation gate opened 3h early, and the countdown label
+ * rendered the day before the one the creator picked.
+ *
+ * Same fixed -03:00 offset rationale as saoPauloEndOfDay: no DST in Brazil
+ * since 2019, so the start-of-day boundary is unambiguous.
+ */
+export function saoPauloStartOfDay(dayStr: string): Date {
+  return new Date(`${dayStr}T00:00:00.000-03:00`);
+}

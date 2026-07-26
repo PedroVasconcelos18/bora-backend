@@ -5,6 +5,76 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InvitesService } from '../invites/invites.service';
 import { PaymentsService } from '../payments/payments.service';
 
+describe('ChallengesService.create — startsAt boundary', () => {
+  let service: ChallengesService;
+  let tx: {
+    challenge: { create: jest.Mock };
+    participant: { create: jest.Mock };
+    invite: { create: jest.Mock };
+  };
+
+  const createdChallenge = {
+    id: 'challenge-1',
+    title: 'Bora treinar',
+    emoji: '🏋️',
+    durationDays: 30,
+    collabAmount: { toString: () => '20' },
+    platformFee: { toString: () => '10' },
+    status: 'WAITING',
+    creatorId: 'creator-1',
+    createdAt: new Date('2026-07-26T05:00:00.000Z'),
+    startsAt: null,
+  };
+
+  const dto = {
+    title: 'Bora treinar',
+    emoji: '🏋️',
+    durationDays: 30,
+    collabAmount: 20,
+    invitees: ['amiga@example.com', 'amigo@example.com'],
+  };
+
+  beforeEach(async () => {
+    tx = {
+      challenge: { create: jest.fn().mockResolvedValue(createdChallenge) },
+      participant: { create: jest.fn().mockResolvedValue({}) },
+      invite: {
+        create: jest.fn().mockResolvedValue({ token: 'tok', targetEmail: 'amiga@example.com' }),
+      },
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        ChallengesService,
+        {
+          provide: PrismaService,
+          useValue: { $transaction: jest.fn((cb: (t: typeof tx) => unknown) => cb(tx)) },
+        },
+        { provide: InvitesService, useValue: { dispatchInvites: jest.fn().mockResolvedValue([]) } },
+        { provide: PaymentsService, useValue: {} },
+      ],
+    }).compile();
+
+    service = moduleRef.get(ChallengesService);
+  });
+
+  it('persists startsAt as midnight in São Paulo, not midnight UTC', async () => {
+    await service.create({ ...dto, startDate: '2026-07-29' }, 'creator-1');
+
+    const persisted = tx.challenge.create.mock.calls[0][0].data.startsAt as Date;
+    // 00:00 SP == 03:00Z. The old `new Date('2026-07-29')` produced 00:00Z,
+    // which is 28/07 21:00 in SP — that is what pushed the ranking's day 1 and
+    // the countdown label one day back.
+    expect(persisted.toISOString()).toBe('2026-07-29T03:00:00.000Z');
+  });
+
+  it('keeps startsAt null when no start date was chosen', async () => {
+    await service.create(dto, 'creator-1');
+
+    expect(tx.challenge.create.mock.calls[0][0].data.startsAt).toBeNull();
+  });
+});
+
 describe('ChallengesService.cancel', () => {
   let service: ChallengesService;
   let prisma: { challenge: { findUnique: jest.Mock } };
