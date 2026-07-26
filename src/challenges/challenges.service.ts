@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InvitesService, InviteWithLink } from '../invites/invites.service';
 import { PaymentsService } from '../payments/payments.service';
 import { CreateChallengeDto } from './dto/create-challenge.dto';
+import { saoPauloStartOfDay } from '../common/utils/sao-paulo-day.util';
 
 export interface ChallengeWithLinks {
   id: string;
@@ -53,6 +54,13 @@ export class ChallengesService {
         // planejada (feedback): a ativação automática (>=3 pagos) só dispara a
         // partir dela; sem data escolhida fica null e o desafio começa assim
         // que a turma paga (comportamento antigo).
+        //
+        // saoPauloStartOfDay (não `new Date(dto.startDate)`): a string vem como
+        // 'YYYY-MM-DD' e o construtor a interpreta como meia-noite UTC, que em
+        // SP é 21:00 da VÉSPERA. Com isso o dia 1 do ranking caía um dia antes
+        // do início escolhido — dia em que ninguém podia postar, logo `falhou`
+        // pra turma inteira. Persistindo o instante certo, ranking, gate de
+        // ativação (payments.service) e deadline-cancel.job passam a concordar.
         const challenge = await tx.challenge.create({
           data: {
             title: dto.title,
@@ -62,7 +70,7 @@ export class ChallengesService {
             platformFee: 10,
             status: 'WAITING',
             creatorId,
-            startsAt: dto.startDate ? new Date(dto.startDate) : null,
+            startsAt: dto.startDate ? saoPauloStartOfDay(dto.startDate) : null,
           },
         });
 

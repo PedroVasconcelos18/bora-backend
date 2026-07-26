@@ -1,4 +1,4 @@
-import { saoPauloDay, saoPauloEndOfDay } from './sao-paulo-day.util';
+import { saoPauloDay, saoPauloEndOfDay, saoPauloStartOfDay } from './sao-paulo-day.util';
 
 describe('sao-paulo-day.util', () => {
   describe('saoPauloDay', () => {
@@ -19,6 +19,36 @@ describe('sao-paulo-day.util', () => {
       expect(saoPauloDay(close)).toBe('2026-07-18');
       // One millisecond later rolls into the next SP day.
       expect(saoPauloDay(new Date(close.getTime() + 1))).toBe('2026-07-19');
+    });
+  });
+
+  describe('saoPauloStartOfDay', () => {
+    it('returns 00:00 SP as the correct UTC instant for a known day', () => {
+      expect(saoPauloStartOfDay('2026-07-29').toISOString()).toBe('2026-07-29T03:00:00.000Z');
+    });
+
+    it('round-trips through saoPauloDay — the bug UTC midnight caused', () => {
+      // The old `new Date('2026-07-29')` landed on the PREVIOUS SP day, which is
+      // what pushed the ranking's day 1 one day back.
+      expect(saoPauloDay(new Date('2026-07-29'))).toBe('2026-07-28');
+      expect(saoPauloDay(saoPauloStartOfDay('2026-07-29'))).toBe('2026-07-29');
+    });
+
+    it('brackets the SP day together with saoPauloEndOfDay', () => {
+      const start = saoPauloStartOfDay('2026-07-29');
+      const end = saoPauloEndOfDay('2026-07-29');
+      expect(start.getTime()).toBeLessThan(end.getTime());
+      // One millisecond before the start belongs to the previous SP day.
+      expect(saoPauloDay(new Date(start.getTime() - 1))).toBe('2026-07-28');
+    });
+
+    it('produces day-1 == the chosen start date in the ranking derivation', () => {
+      // Mirrors ranking.service.ts: dayStrings[i] = saoPauloDay(startsAt + i*24h).
+      const startsAt = saoPauloStartOfDay('2026-07-25');
+      const dayOne = saoPauloDay(startsAt);
+      const dayTwo = saoPauloDay(new Date(startsAt.getTime() + 24 * 60 * 60 * 1000));
+      expect(dayOne).toBe('2026-07-25');
+      expect(dayTwo).toBe('2026-07-26');
     });
   });
 });
