@@ -27,6 +27,7 @@ export interface VotableEvidence {
   authorName: string;
   objectKey: string;
   windowClosesAt: Date;
+  postedAt: Date;
   status: string;
   hasVoted: boolean;
   myVote: VoteValue | null;
@@ -111,10 +112,18 @@ export class VotingService {
   }
 
   /**
-   * The votable-evidence list for today (D-04): PENDING evidences from OTHER
-   * participants for the current America/Sao_Paulo day. Deliberately omits
-   * sim/não tallies — only `status`/`hasVoted` are returned, never a count
-   * (D-05, T-03-10, Information Disclosure mitigation).
+   * The day's evidence list (D-04): evidences from OTHER participants for the
+   * current America/Sao_Paulo day. Deliberately omits sim/não tallies — only
+   * `status`/`hasVoted` are returned, never a count (D-05, T-03-10,
+   * Information Disclosure mitigation).
+   *
+   * NOT filtered by `status: 'PENDING'` anymore. With early-close (item G) an
+   * evidence resolves the moment every eligible voter has voted, and filtering
+   * on PENDING made it vanish from the tab — the day's window closed showing
+   * "nenhuma evidência pra votar agora" instead of the outcome. Keeping the
+   * resolved rows lets the card render its final ACCEPTED/REJECTED badge for
+   * the rest of the day. Only the terminal status is exposed, never the tally,
+   * so the Information Disclosure mitigation above still holds.
    */
   async listVotableEvidences(userId: string, challengeId: string): Promise<VotableEvidence[]> {
     const participant = await this.resolveParticipant(userId, challengeId);
@@ -124,7 +133,6 @@ export class VotingService {
       where: {
         challengeId,
         evidenceDate,
-        status: 'PENDING',
         participantId: { not: participant.id },
       },
       include: {
@@ -139,6 +147,11 @@ export class VotingService {
       authorName: evidence.participant.user.name,
       objectKey: evidence.objectKey,
       windowClosesAt: evidence.windowClosesAt,
+      // The real posting instant. The frontend used to derive it as
+      // windowClosesAt − 24h, an assumption item G broke when the window moved
+      // to 23:59 of the evidence's own day — an evidence posted a minute ago
+      // rendered as "postou há 3h".
+      postedAt: evidence.postedAt,
       status: evidence.status,
       hasVoted: evidence.votes.length > 0,
       // Item I: expose HOW the caller voted so the badge can render green (SIM)

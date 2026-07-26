@@ -136,6 +136,7 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
       participant: { user: { name: 'Amiga' } },
       objectKey: 'evidences/challenge-1/participant-author/2026-07-18.jpg',
       windowClosesAt: new Date(),
+      postedAt: new Date('2026-07-18T14:00:00.000Z'),
       status: 'PENDING',
     };
 
@@ -155,6 +156,32 @@ describe('VotingService (VOTE-01/02/03/04, D-05)', () => {
 
       expect(result[0].myVote).toBeNull();
       expect(result[0].hasVoted).toBe(false);
+    });
+
+    it('exposes the real postedAt instead of leaving it to a windowClosesAt−24h guess', async () => {
+      prisma.evidence.findMany.mockResolvedValueOnce([{ ...base, votes: [] }]);
+
+      const result = await service.listVotableEvidences(userId, challengeId);
+
+      expect(result[0].postedAt).toEqual(base.postedAt);
+    });
+
+    it('does NOT filter by status — a resolved evidence stays in the day list with its outcome', async () => {
+      prisma.evidence.findMany.mockResolvedValueOnce([
+        { ...base, status: 'ACCEPTED', votes: [{ value: 'SIM' }] },
+      ]);
+
+      const result = await service.listVotableEvidences(userId, challengeId);
+
+      // Early-close (item G) resolves the evidence mid-day; it must remain
+      // visible so the window closes WITH the result rather than going empty.
+      expect(prisma.evidence.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.not.objectContaining({ status: expect.anything() }),
+        }),
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].status).toBe('ACCEPTED');
     });
   });
 
