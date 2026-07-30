@@ -82,7 +82,7 @@ describe('PaymentsService', () => {
   let config: { getOrThrow: jest.Mock };
   let eventEmitter: { emit: jest.Mock };
   let tx: {
-    payment: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
+    payment: { findUnique: jest.Mock; findFirst: jest.Mock; update: jest.Mock; updateMany: jest.Mock };
     participant: { update: jest.Mock; count: jest.Mock };
     challenge: { update: jest.Mock; findUnique: jest.Mock };
     invite: { updateMany: jest.Mock };
@@ -90,7 +90,7 @@ describe('PaymentsService', () => {
   };
   let prisma: {
     participant: { findUnique: jest.Mock; update: jest.Mock };
-    payment: { create: jest.Mock; findFirst: jest.Mock };
+    payment: { create: jest.Mock; findFirst: jest.Mock; findUnique: jest.Mock };
     user: { update: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -159,8 +159,13 @@ describe('PaymentsService', () => {
     tx = {
       payment: {
         findUnique: jest.fn(),
+        // Default: this participant has no other collected payment, so the
+        // duplicate-collection guard is inert and every pre-existing test takes
+        // the normal crediting path.
+        findFirst: jest.fn().mockResolvedValue(null),
         update: jest.fn(),
-        updateMany: jest.fn(),
+        // Prisma always answers `{ count }`; the sibling-cancel reads it.
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       participant: {
         update: jest.fn(),
@@ -187,6 +192,9 @@ describe('PaymentsService', () => {
       },
       payment: {
         findFirst: findFirstOverRows(() => paymentRows),
+        // #4 hardening: the 404 catch asks whether WE hold a row under this
+        // external id. Default "no row" preserves the ack path.
+        findUnique: jest.fn().mockResolvedValue(null),
         create: jest.fn().mockResolvedValue({
           id: 'payment-1',
           externalId: chargeResult.externalId,
@@ -527,6 +535,51 @@ describe('PaymentsService', () => {
 
         expect(result.ticketUrl).toBe('');
       });
+
+      /**
+       * NIT 8 (review hardening) — "still valid" is not the same as "usable".
+       *
+       * `expiresAt > now` hands back a QR with seconds of life on it, and the
+       * user discovers it is dead while switching to their bank app. The trap
+       * has no exit either: "Gerar novo QR" POSTs again, matches the same
+       * nearly-dead row, and returns it again until it finally expires.
+       */
+      it('does NOT reuse a cobrança about to expire — a QR with 30s left is a dead end, not a reusable charge', async () => {
+        paymentRows.push(
+          storedPendingPayment({
+            id: 'payment-almost-dead',
+            expiresAt: new Date(Date.now() + 30_000),
+          }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+        expect(result.paymentId).toBe('payment-1');
+      });
+
+      it('still reuses a cobrança with comfortable life left — the margin is a minute, not a rewrite of the reuse rule', async () => {
+        paymentRows.push(
+          storedPendingPayment({ id: 'payment-fresh', expiresAt: new Date(Date.now() + 5 * 60_000) }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(psp.createPixCharge).not.toHaveBeenCalled();
+        expect(result.paymentId).toBe('payment-fresh');
+      });
+
+      it('asks Postgres for a FUTURE-dated expiry, not merely a non-expired one (the margin lives in the query)', async () => {
+        await service.createCashIn('participant-1');
+
+        const where = prisma.payment.findFirst.mock.calls[0][0].where as {
+          expiresAt: { gt: Date };
+        };
+
+        // Pinned as a lower bound rather than an exact value so the constant can
+        // be tuned without a false failure — but a plain `new Date()` fails it.
+        expect(where.expiresAt.gt.getTime()).toBeGreaterThan(Date.now() + 30_000);
+      });
     });
 
     it('maps a psp.createPixCharge failure to a friendly ServiceUnavailableException instead of leaking a raw 500 (GAP 3)', async () => {
@@ -795,6 +848,85 @@ describe('PaymentsService', () => {
     });
 
     /**
+     * REVIEW HARDENING (#4) — a provider 404 is only safe to ack if we do not
+     * hold a live charge under that id.
+     *
+     * The shipped version acked EVERY provider 404 without ever looking
+     * locally, so it could not tell the safe case (an id we never issued —
+     * typically another environment sharing the same Mercado Pago account) from
+     * the dangerous one (a charge WE created that the provider now disowns).
+     * Acking the dangerous case throws away the only recovery artifact left:
+     * Mercado Pago's redelivery, which preserves the notification until the
+     * fault — realistically a credential/account mismatch — is repaired.
+     *
+     * Both directions are pinned, because the infinite-retry loop #3 removed
+     * must not come back for the genuinely-unknown id.
+     */
+    describe('#4 hardening — 404 for an id WE hold PENDING is not acknowledged', () => {
+      const notFound = () =>
+        psp.getPayment.mockRejectedValue(new PaymentNotFoundError('mp-external-id-123', 'code 2000'));
+
+      it('THROWS (non-200) when a local PENDING row exists for the 404d external — MP keeps redelivering', async () => {
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue({ id: 'payment-1', status: 'PENDING' });
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).rejects.toBeInstanceOf(
+          ServiceUnavailableException,
+        );
+      });
+
+      it('writes nothing on that path — a provider that disowns our charge must not move money state', async () => {
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue({ id: 'payment-1', status: 'PENDING' });
+
+        await service.handleWebhook('mp-external-id-123', {}).catch(() => undefined);
+
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(eventEmitter.emit).not.toHaveBeenCalled();
+      });
+
+      it('logs at ERROR and names the credentials as the thing to check', async () => {
+        const errorSpy = jest.spyOn(service['logger'], 'error');
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue({ id: 'payment-1', status: 'PENDING' });
+
+        await service.handleWebhook('mp-external-id-123', {}).catch(() => undefined);
+
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('MERCADOPAGO_ACCESS_TOKEN'));
+      });
+
+      it('STILL acks (200) when we hold no row at all — the #3 property survives, no infinite retry', async () => {
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue(null);
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).resolves.toEqual({
+          activated: false,
+        });
+      });
+
+      it('acks a 404 for a row already APPROVED — nothing left to preserve', async () => {
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue({ id: 'payment-1', status: 'APPROVED' });
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).resolves.toEqual({
+          activated: false,
+        });
+      });
+
+      it('acks a 404 for a row already CANCELLED — this is what terminates the retry loop', async () => {
+        // The reconciliation sweep settles the row (or the breaker decides it
+        // must not); once it is no longer PENDING a redelivery acks and the
+        // retries stop. Without this the non-200 above would have no exit.
+        notFound();
+        prisma.payment.findUnique.mockResolvedValue({ id: 'payment-1', status: 'CANCELLED' });
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).resolves.toEqual({
+          activated: false,
+        });
+      });
+    });
+
+    /**
      * #4 — webhook arriving before (or without) our local INSERT.
      *
      * We keep acking, because at this instant "row not committed yet" and "row
@@ -865,6 +997,130 @@ describe('PaymentsService', () => {
           where: { id: 'participant-1' },
           data: { status: 'PAID', paidAt: expect.any(Date) },
         });
+      });
+    });
+
+    /**
+     * REVIEW HARDENING (#3) — an entry is collected ONCE, even when several
+     * QRs for it exist.
+     *
+     * #1a and #1b stop new duplicates being minted, but they do nothing about
+     * duplicates already outstanding — including the four live QRs participant
+     * 4bf8ee39 accumulated in production on 30/07/2026. Nothing invalidated a
+     * sibling when one of them was paid: the webhook for the second QR found a
+     * non-APPROVED row, credited it, re-marked the participant PAID, and
+     * emitted a second payment.confirmed. Money in twice; prize pool (computed
+     * from the PAID participant COUNT) unchanged; the extra row in no queue.
+     */
+    describe('#3 — a second cobrança for the same entry never credits twice', () => {
+      it('cancels the OTHER PENDING cobranças of the same participant when one is approved', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue(existingPayment);
+        tx.payment.updateMany.mockResolvedValue({ count: 3 });
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(tx.payment.updateMany).toHaveBeenCalledWith({
+          where: {
+            participantId: 'participant-1',
+            challengeId: 'challenge-1',
+            status: 'PENDING',
+            // Never the row being approved, and never another participant's or
+            // another challenge's charge. Pinned exactly: this is a money-state
+            // write, and a too-broad `where` here is worse than the bug.
+            id: { not: 'payment-1' },
+          },
+          data: { status: 'CANCELLED' },
+        });
+      });
+
+      it('says out loud that the cancelled siblings are still payable at Mercado Pago', async () => {
+        const warnSpy = jest.spyOn(service['logger'], 'warn');
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue(existingPayment);
+        tx.payment.updateMany.mockResolvedValue({ count: 3 });
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        // The local cancel is only half the fix; the operator has to know the
+        // other half is not covered.
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('stay payable at Mercado Pago'));
+      });
+
+      it('books a SECOND collected payment as REFUND_PENDING instead of crediting it again', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue({ ...existingPayment, id: 'payment-second' });
+        // The entry was already collected by another payment.
+        tx.payment.findFirst.mockResolvedValue({ id: 'payment-first' });
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(tx.payment.update).toHaveBeenCalledWith({
+          where: { id: 'payment-second' },
+          data: {
+            status: 'REFUND_PENDING',
+            refundReason: 'Cobrança Pix duplicada — a entrada deste participante já havia sido paga.',
+          },
+        });
+        // REFUND_PENDING IS the manual refund queue (D-10, AdminService), so
+        // the extra money becomes an operator task instead of vanishing.
+      });
+
+      it('does NOT re-mark the participant PAID and does NOT emit a second payment.confirmed', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue({ ...existingPayment, id: 'payment-second' });
+        tx.payment.findFirst.mockResolvedValue({ id: 'payment-first' });
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(tx.participant.update).not.toHaveBeenCalled();
+        expect(eventEmitter.emit).not.toHaveBeenCalled();
+        // And it must not activate anything off the back of a duplicate.
+        expect(tx.$executeRaw).not.toHaveBeenCalled();
+      });
+
+      it('logs the duplicate collection at ERROR — money in twice is an incident, not a debug line', async () => {
+        const errorSpy = jest.spyOn(service['logger'], 'error');
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue({ ...existingPayment, id: 'payment-second' });
+        tx.payment.findFirst.mockResolvedValue({ id: 'payment-first' });
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('DUPLICATE COLLECTION'));
+      });
+
+      it('counts an already-REFUND_PENDING sibling as collected too (a cancelled challenge must not reopen crediting)', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue(existingPayment);
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(tx.payment.findFirst).toHaveBeenCalledWith({
+          where: {
+            participantId: 'participant-1',
+            status: { in: ['APPROVED', 'REFUND_PENDING'] },
+            id: { not: 'payment-1' },
+          },
+          select: { id: true },
+        });
+      });
+
+      it('the ordinary single-payment case is untouched — it credits and emits exactly as before', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+        tx.payment.findUnique.mockResolvedValue(existingPayment);
+        tx.payment.findFirst.mockResolvedValue(null);
+
+        await service.handleWebhook('mp-external-id-123', {});
+
+        expect(tx.participant.update).toHaveBeenCalledWith({
+          where: { id: 'participant-1' },
+          data: { status: 'PAID', paidAt: expect.any(Date) },
+        });
+        expect(eventEmitter.emit).toHaveBeenCalledWith(
+          'payment.confirmed',
+          expect.objectContaining({ paymentId: 'payment-1' }),
+        );
       });
     });
   });
