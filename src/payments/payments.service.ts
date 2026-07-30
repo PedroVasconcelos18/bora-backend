@@ -64,6 +64,9 @@ export class PaymentsService {
    * while the challenge is WAITING (pitfall M4 — the prize pool is computed
    * from the paid count, which must be locked once the challenge activates)
    * and only from a participant who has NOT paid yet (#1a, below).
+   *
+   * Idempotent per entry (#1b): a participant with a still-valid PENDING
+   * cobrança gets that same QR back instead of a second Mercado Pago charge.
    */
   async createCashIn(participantId: string, pixKey?: string): Promise<CashInResult> {
     const participant = await this.prisma.participant.findUnique({
@@ -128,6 +131,70 @@ export class PaymentsService {
       }
     }
 
+    // #1b — an entry has ONE live cobrança at a time. Reopening the pay screen
+    // (remount, back-navigation, refresh) must return the SAME QR, never mint
+    // another Mercado Pago charge. #1a closed the leak AFTER payment; this
+    // closes the much larger one BEFORE it — the one that actually produced
+    // four simultaneously-valid QRs for participant 4bf8ee39 in production.
+    //
+    // Reuse predicate — three legs, ALL required, evaluated by Postgres:
+    //   1. status = PENDING     — not already approved/cancelled/refunded
+    //   2. qrCode IS NOT NULL   — rows written before the qr_code migration
+    //                             have no stored QR; there is nothing to hand
+    //                             back, so they must fall through (no backfill)
+    //   3. expiresAt > now      — an expired cobrança cannot be paid; handing
+    //                             it back would strand the user on a dead QR
+    // Failing any leg is NOT an error — it just means "mint a new one". This
+    // branch never throws, so legacy/expired rows degrade gracefully.
+    //
+    // Newest-first: if several reusable rows exist (pre-fix production data,
+    // or the concurrency window noted below), the most recent one is the one
+    // the user most likely already has on screen.
+    //
+    // Lives in createCashIn — not in a caller — for the same reason as #1a:
+    // payEntry (creator) and InvitesService.acceptAndPay (invitee) both
+    // converge here, and here is where a charge is actually born.
+    //
+    // Known limitation (carried over from #1a): this is read-then-write, so
+    // two truly simultaneous requests can both miss and both create. Closing
+    // it would need either a partial unique index on (participant_id) WHERE
+    // status = 'PENDING' — which today would permanently LOCK OUT a user whose
+    // expired PENDING row is never cancelled (that sweep is #2, not yet built)
+    // — or a row lock held across the Mercado Pago HTTP call, which ties a DB
+    // transaction to a 5s external timeout. Both trade a duplicate-charge bug
+    // for a cannot-pay-at-all bug, so neither is taken here. The window
+    // shrinks from "every remount for 30 minutes" to "two requests in the same
+    // instant", which is the bulk of the damage.
+    const reusable = await this.prisma.payment.findFirst({
+      where: {
+        participantId,
+        status: 'PENDING',
+        qrCode: { not: null },
+        qrCodeBase64: { not: null },
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // The `if` re-states legs 2 and 3 that the query already enforced: Prisma
+    // types these columns as nullable no matter what the filter says, and this
+    // is the money path — a `null as string` must never reach the client.
+    if (reusable?.qrCode && reusable.qrCodeBase64 && reusable.expiresAt) {
+      this.logger.log(
+        `createCashIn: reusing PENDING payment ${reusable.id} (external=${reusable.externalId}) for participant ${participantId} — no new charge created`,
+      );
+
+      return {
+        qrCode: reusable.qrCode,
+        qrCodeBase64: reusable.qrCodeBase64,
+        // '' is the same fallback MercadoPagoAdapter already uses for a
+        // missing ticket_url, so downstream sees nothing new.
+        ticketUrl: reusable.ticketUrl ?? '',
+        expiresAt: reusable.expiresAt,
+        paymentId: reusable.id,
+      };
+    }
+
     // D-15: always send an idempotency key on charge creation.
     const idempotencyKey = `${participantId}-${Date.now()}`;
 
@@ -161,6 +228,16 @@ export class PaymentsService {
         challengeId: participant.challengeId,
         amount: participant.challenge.collabAmount,
         status: 'PENDING',
+        // #1b: persist the charge artifacts so the reuse branch above can
+        // answer the next request from OUR Postgres, with no PSP round trip.
+        qrCode: charge.qrCode,
+        qrCodeBase64: charge.qrCodeBase64,
+        ticketUrl: charge.ticketUrl,
+        // Taken from the PSP result rather than re-derived here: for Mercado
+        // Pago this is the exact instant sent as `date_of_expiration` on the
+        // charge, so the expiry we enforce and the expiry MP enforces are the
+        // same value, not two independent guesses that can drift.
+        expiresAt: charge.expiresAt,
       },
     });
 
