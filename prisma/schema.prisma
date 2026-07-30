@@ -121,6 +121,20 @@ model Payment {
   refundedAt        DateTime?     @map("refunded_at")
   refundReason      String?       @map("refund_reason")
   pixKey            String?       @map("pix_key")
+  // #1b — the charge artifacts, persisted at creation time so reopening the
+  // pay screen returns the SAME QR instead of minting a second Mercado Pago
+  // charge (production incident 30/07/2026: four simultaneous QRs for one
+  // entry). Reading them from OUR Postgres keeps the PSP out of the reopen
+  // path entirely. All nullable, no backfill: rows created before this
+  // migration have qrCode = null and simply fall through to the normal
+  // create path.
+  qrCode            String?       @map("qr_code")
+  qrCodeBase64      String?       @map("qr_code_base64")
+  ticketUrl         String?       @map("ticket_url")
+  // The instant this cobrança stops being valid. Same value we send to Mercado
+  // Pago as `date_of_expiration`, so DB and PSP agree by construction rather
+  // than by a re-derived guess.
+  expiresAt         DateTime?     @map("expires_at")
 
   @@index([status])
   @@map("payments")

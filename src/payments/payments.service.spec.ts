@@ -13,6 +13,68 @@ import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
 import { MercadoPagoAdapter } from './adapters/mercadopago.adapter';
 
+/** The Payment columns the #1b reuse path reads. */
+interface StoredPayment {
+  id: string;
+  externalId: string | null;
+  participantId: string;
+  status: string;
+  qrCode: string | null;
+  qrCodeBase64: string | null;
+  ticketUrl: string | null;
+  expiresAt: Date | null;
+  createdAt: Date;
+}
+
+/** The subset of Prisma's `where` that the #1b reuse query builds. */
+interface ReuseWhere {
+  participantId?: string;
+  status?: string;
+  qrCode?: { not: null };
+  qrCodeBase64?: { not: null };
+  expiresAt?: { gt: Date };
+}
+
+/**
+ * A `payment.findFirst` that EVALUATES the where clause the service sends,
+ * rather than returning a canned row.
+ *
+ * This distinction is the whole point: against a canned mock, the
+ * "expired PENDING row" test below would still pass even if the service
+ * dropped its `expiresAt: { gt: now }` leg — the mock, not the code, would be
+ * deciding the answer. Against this fake, dropping a leg fails the test.
+ */
+function findFirstOverRows(getRows: () => StoredPayment[]): jest.Mock {
+  return jest.fn(
+    async ({
+      where,
+      orderBy,
+    }: {
+      where: ReuseWhere;
+      orderBy?: { createdAt: 'asc' | 'desc' };
+    }) => {
+      const matches = getRows().filter(
+        (row) =>
+          (where.participantId === undefined || row.participantId === where.participantId) &&
+          (where.status === undefined || row.status === where.status) &&
+          // `{ not: null }` present => the row must have a non-null value
+          (where.qrCode?.not !== null || row.qrCode !== null) &&
+          (where.qrCodeBase64?.not !== null || row.qrCodeBase64 !== null) &&
+          (where.expiresAt?.gt === undefined ||
+            (row.expiresAt !== null && row.expiresAt.getTime() > where.expiresAt.gt.getTime())),
+      );
+
+      matches.sort((a, b) =>
+        orderBy?.createdAt === 'desc'
+          ? b.createdAt.getTime() - a.createdAt.getTime()
+          : a.createdAt.getTime() - b.createdAt.getTime(),
+      );
+
+      return matches[0] ?? null;
+    },
+  );
+}
+
 describe('PaymentsService', () => {
   let service: PaymentsService;
   let psp: jest.Mocked<IPaymentProvider>;
@@ -27,10 +89,16 @@ describe('PaymentsService', () => {
   };
   let prisma: {
     participant: { findUnique: jest.Mock; update: jest.Mock };
-    payment: { create: jest.Mock };
+    payment: { create: jest.Mock; findFirst: jest.Mock };
     user: { update: jest.Mock };
     $transaction: jest.Mock;
   };
+
+  /**
+   * #1b — rows the fake `payment.findFirst` below searches. Tests push the
+   * Payment rows they want to exist; empty means "no prior charge".
+   */
+  let paymentRows: StoredPayment[];
 
   const chargeResult: PixChargeResult = {
     externalId: 'mp-external-id-123',
@@ -56,6 +124,24 @@ describe('PaymentsService', () => {
   };
 
   const webhookSecret = 'test-webhook-secret-fixture';
+
+  /**
+   * #1b fixture — the row `createCashIn` would have written for a charge that
+   * is still inside its 30-minute window. Overrides let a test age it out or
+   * strip its QR (the pre-migration shape).
+   */
+  const storedPendingPayment = (overrides: Partial<StoredPayment> = {}): StoredPayment => ({
+    id: 'payment-existing',
+    externalId: 'mp-external-existing',
+    participantId: 'participant-1',
+    status: 'PENDING',
+    qrCode: '00020126...stored-copia-e-cola',
+    qrCodeBase64: 'stored-base64-qr',
+    ticketUrl: 'https://www.mercadopago.com/ticket/existing',
+    expiresAt: new Date(Date.now() + 20 * 60_000),
+    createdAt: new Date(Date.now() - 10 * 60_000),
+    ...overrides,
+  });
 
   beforeEach(async () => {
     psp = {
@@ -89,12 +175,17 @@ describe('PaymentsService', () => {
       $executeRaw: jest.fn().mockResolvedValue(0),
     };
 
+    // #1b: default is "no prior charge exists" — every pre-existing test
+    // therefore takes the create path exactly as before.
+    paymentRows = [];
+
     prisma = {
       participant: {
         findUnique: jest.fn().mockResolvedValue(waitingParticipant),
         update: jest.fn().mockResolvedValue({ ...waitingParticipant, pixKey: 'joao@pix' }),
       },
       payment: {
+        findFirst: findFirstOverRows(() => paymentRows),
         create: jest.fn().mockResolvedValue({
           id: 'payment-1',
           externalId: chargeResult.externalId,
@@ -238,6 +329,203 @@ describe('PaymentsService', () => {
 
       expect(prisma.participant.update).not.toHaveBeenCalled();
       expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('persists the QR artifacts and the expiry on the Payment row so a later call can reuse them (#1b write path)', async () => {
+      await service.createCashIn('participant-1');
+
+      expect(prisma.payment.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          qrCode: chargeResult.qrCode,
+          qrCodeBase64: chargeResult.qrCodeBase64,
+          ticketUrl: chargeResult.ticketUrl,
+          // Taken from the PSP result — the same instant sent to Mercado Pago
+          // as date_of_expiration — never re-derived from Date.now() here.
+          expiresAt: chargeResult.expiresAt,
+        }),
+      });
+    });
+
+    describe('#1b — reuse of a live PENDING cobrança', () => {
+      it('pushes the full reuse predicate down to Postgres — own participant, PENDING, non-null QR, future expiry, newest first', async () => {
+        await service.createCashIn('participant-1');
+
+        // Asserted on the query and not only on the outcome: the service also
+        // re-checks qrCode/expiresAt in TypeScript (Prisma types them nullable
+        // regardless of the filter), and that narrowing would mask a missing
+        // WHERE leg. Both layers are load-bearing, so both are pinned.
+        expect(prisma.payment.findFirst).toHaveBeenCalledWith({
+          where: {
+            participantId: 'participant-1',
+            status: 'PENDING',
+            qrCode: { not: null },
+            qrCodeBase64: { not: null },
+            expiresAt: { gt: expect.any(Date) },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+      });
+
+      it('returns the STORED QR and does NOT create a second Mercado Pago charge when a PENDING payment is still valid', async () => {
+        const existing = storedPendingPayment();
+        paymentRows.push(existing);
+
+        const result = await service.createCashIn('participant-1');
+
+        // The bug this closes: before #1b every screen remount reached the PSP
+        // and minted another QR. Participant 4bf8ee39 ended up with four.
+        expect(psp.createPixCharge).not.toHaveBeenCalled();
+        expect(prisma.payment.create).not.toHaveBeenCalled();
+
+        expect(result).toEqual({
+          qrCode: existing.qrCode,
+          qrCodeBase64: existing.qrCodeBase64,
+          ticketUrl: existing.ticketUrl,
+          expiresAt: existing.expiresAt,
+          paymentId: existing.id,
+        });
+      });
+
+      it('two consecutive calls (the reopen-the-screen sequence) yield ONE charge and the same paymentId', async () => {
+        const first = await service.createCashIn('participant-1');
+
+        // The row the first call would have written now exists.
+        paymentRows.push(
+          storedPendingPayment({
+            id: first.paymentId,
+            externalId: chargeResult.externalId,
+            qrCode: chargeResult.qrCode,
+            qrCodeBase64: chargeResult.qrCodeBase64,
+            ticketUrl: chargeResult.ticketUrl,
+            expiresAt: chargeResult.expiresAt,
+          }),
+        );
+        // chargeResult's fixture expiry is a 2026 literal in the past — age it
+        // forward so this row is genuinely inside its window.
+        paymentRows[0].expiresAt = new Date(Date.now() + 25 * 60_000);
+
+        const second = await service.createCashIn('participant-1');
+
+        expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+        expect(second.paymentId).toBe(first.paymentId);
+        expect(second.qrCode).toBe(first.qrCode);
+      });
+
+      it('creates a NEW charge when the only PENDING payment has already expired — an unpayable QR is never handed back', async () => {
+        paymentRows.push(
+          storedPendingPayment({
+            id: 'payment-stale',
+            expiresAt: new Date(Date.now() - 60_000),
+            createdAt: new Date(Date.now() - 31 * 60_000),
+          }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+        expect(prisma.payment.create).toHaveBeenCalledTimes(1);
+        expect(result.paymentId).toBe('payment-1');
+        expect(result.qrCode).toBe(chargeResult.qrCode);
+      });
+
+      it('creates a NEW charge for a legacy PENDING row written before the qr_code migration (qrCode = null) — no crash, no null QR', async () => {
+        paymentRows.push(
+          storedPendingPayment({
+            id: 'payment-legacy',
+            qrCode: null,
+            qrCodeBase64: null,
+            ticketUrl: null,
+            expiresAt: null,
+          }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        // There is nothing to give back, so the row must fall through rather
+        // than resolve with nulls or throw. Decided against a backfill: those
+        // rows' QRs live only at Mercado Pago.
+        expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+        expect(result.qrCode).toBe(chargeResult.qrCode);
+        expect(result.qrCodeBase64).toBe(chargeResult.qrCodeBase64);
+      });
+
+      it('does not reuse another participant\'s live cobrança', async () => {
+        paymentRows.push(
+          storedPendingPayment({ id: 'payment-someone-else', participantId: 'participant-2' }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+        expect(result.paymentId).toBe('payment-1');
+      });
+
+      it('does not reuse a payment that already left PENDING (APPROVED / CANCELLED / REFUND_PENDING)', async () => {
+        for (const status of ['APPROVED', 'CANCELLED', 'REFUND_PENDING']) {
+          jest.clearAllMocks();
+          paymentRows.length = 0;
+          paymentRows.push(storedPendingPayment({ id: `payment-${status}`, status }));
+
+          const result = await service.createCashIn('participant-1');
+
+          expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+          expect(result.paymentId).toBe('payment-1');
+        }
+      });
+
+      it('picks the most recent reusable cobrança when production left several behind (pre-fix data)', async () => {
+        paymentRows.push(
+          storedPendingPayment({
+            id: 'payment-older',
+            qrCode: 'older-qr',
+            createdAt: new Date(Date.now() - 20 * 60_000),
+          }),
+          storedPendingPayment({
+            id: 'payment-newer',
+            qrCode: 'newer-qr',
+            createdAt: new Date(Date.now() - 2 * 60_000),
+          }),
+        );
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(result.paymentId).toBe('payment-newer');
+        expect(result.qrCode).toBe('newer-qr');
+        expect(psp.createPixCharge).not.toHaveBeenCalled();
+      });
+
+      it('reuse never overrides the #1a PAID guard — an already-paid entry still gets 409, not a recycled QR', async () => {
+        paymentRows.push(storedPendingPayment());
+        prisma.participant.findUnique.mockResolvedValueOnce({
+          ...waitingParticipant,
+          status: 'PAID',
+        });
+
+        await expect(service.createCashIn('participant-1')).rejects.toBeInstanceOf(
+          ConflictException,
+        );
+        expect(prisma.payment.findFirst).not.toHaveBeenCalled();
+      });
+
+      it('still records a pay-time pixKey on the reuse path (D-17 — the key must not be lost by reopening the screen)', async () => {
+        paymentRows.push(storedPendingPayment());
+
+        await service.createCashIn('participant-1', '  outra@chave  ');
+
+        expect(prisma.participant.update).toHaveBeenCalledWith({
+          where: { id: 'participant-1' },
+          data: { pixKey: 'outra@chave' },
+        });
+        expect(psp.createPixCharge).not.toHaveBeenCalled();
+      });
+
+      it('falls back to an empty ticketUrl (never null) when the stored row has none', async () => {
+        paymentRows.push(storedPendingPayment({ ticketUrl: null }));
+
+        const result = await service.createCashIn('participant-1');
+
+        expect(result.ticketUrl).toBe('');
+      });
     });
 
     it('maps a psp.createPixCharge failure to a friendly ServiceUnavailableException instead of leaking a raw 500 (GAP 3)', async () => {
