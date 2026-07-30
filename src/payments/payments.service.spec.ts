@@ -1,5 +1,10 @@
 import { Test } from '@nestjs/testing';
-import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { createHmac } from 'crypto';
@@ -152,6 +157,47 @@ describe('PaymentsService', () => {
 
       await expect(service.createCashIn('participant-1')).rejects.toThrow(BadRequestException);
       expect(psp.createPixCharge).not.toHaveBeenCalled();
+    });
+
+    it('refuses with 409 when the participant already PAID — never a second charge for an entry already collected (#1a)', async () => {
+      prisma.participant.findUnique.mockResolvedValueOnce({
+        ...waitingParticipant,
+        status: 'PAID',
+        paidAt: new Date('2026-07-30T18:28:46.000Z'),
+      });
+
+      // Production repro (participant 4bf8ee39, 30/07/2026): three POSTs landed
+      // AFTER the webhook marked this participant PAID and each returned 201 with
+      // a brand-new MP external id. Without the guard this promise RESOLVES with
+      // a fresh QR — that resolution IS the bug. V1 has no automatic refund
+      // (manual cash-out, custody on the creator's account), so a duplicate
+      // charge is real money lost, not an annoyance.
+      await expect(service.createCashIn('participant-1')).rejects.toBeInstanceOf(ConflictException);
+
+      expect(psp.createPixCharge).not.toHaveBeenCalled();
+      expect(prisma.payment.create).not.toHaveBeenCalled();
+    });
+
+    it('the PAID guard runs before the pixKey write — a duplicate attempt mutates nothing (#1a)', async () => {
+      prisma.participant.findUnique.mockResolvedValueOnce({
+        ...waitingParticipant,
+        status: 'PAID',
+      });
+
+      await expect(service.createCashIn('participant-1', 'joao@pix')).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(prisma.participant.update).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('still charges a participant who has NOT paid yet (the guard is on PAID, not on every repeat call)', async () => {
+      const result = await service.createCashIn('participant-1');
+
+      expect(waitingParticipant.status).toBe('INVITED');
+      expect(psp.createPixCharge).toHaveBeenCalledTimes(1);
+      expect(result.paymentId).toBe('payment-1');
     });
 
     it('trims a pay-time pixKey before persisting it to the participant (T-i98)', async () => {
