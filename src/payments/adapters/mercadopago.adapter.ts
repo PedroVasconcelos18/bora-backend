@@ -1,11 +1,40 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
+import { PaymentNotFoundError } from '../errors/payment-not-found.error';
 import {
   CreatePixChargeParams,
   IPaymentProvider,
   PixChargeResult,
 } from '../interfaces/payment-provider.interface';
+import { describeError } from '../utils/describe-error.util';
+
+/**
+ * Is this rejection Mercado Pago saying "I have no such payment"?
+ *
+ * The SDK does NOT reject with an `Error`: `RestClient.fetch` does
+ * `throw await response.json()` on any non-2xx, so what lands in the catch is
+ * the raw parsed error body — a plain object. Production, 30/07/2026:
+ *   `{ message: 'Payment not found', error: 'not_found', status: 404,
+ *      cause: [{ code: 2000 }] }`
+ *
+ * This predicate is the ONLY place in the codebase allowed to know that shape.
+ * `status` is compared loosely against string and number because it comes from
+ * an untyped JSON body, and `error === 'not_found'` is accepted as an
+ * independent signal so a transport that omits `status` still classifies
+ * correctly. Anything else is NOT a not-found and must keep propagating —
+ * misclassifying a 500 as "not found" would make us permanently cancel a
+ * payment that is merely temporarily unreachable.
+ */
+function isProviderNotFound(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) {
+    return false;
+  }
+
+  const body = err as { status?: unknown; error?: unknown };
+
+  return body.status === 404 || body.status === '404' || body.error === 'not_found';
+}
 
 /**
  * MercadoPagoAdapter implements IPaymentProvider using the official mercadopago SDK.
@@ -90,6 +119,20 @@ export class MercadoPagoAdapter implements IPaymentProvider {
     };
   }
 
+  /**
+   * GET /v1/payments/{id}, with the one failure mode callers must be able to
+   * tell apart normalized into a typed error.
+   *
+   * A 404 becomes `PaymentNotFoundError` (permanent — this id will never
+   * resolve). Every other rejection is rethrown untouched so it stays
+   * transient: the reconciliation sweep skips that row and retries next hour,
+   * and the webhook answers non-200 so Mercado Pago redelivers.
+   *
+   * The unconfigured-token throw below is deliberately NOT a
+   * PaymentNotFoundError: a missing access token is a deployment fault, and
+   * treating it as "not found" would let a misconfigured boot quietly CANCEL
+   * every pending payment on the first cron tick.
+   */
   async getPayment(externalId: string): Promise<{ status: string; externalReference: string | null }> {
     if (!this.payment) {
       throw new Error(
@@ -97,7 +140,19 @@ export class MercadoPagoAdapter implements IPaymentProvider {
       );
     }
 
-    const result = await this.payment.get({ id: externalId });
+    let result: Awaited<ReturnType<Payment['get']>>;
+    try {
+      result = await this.payment.get({ id: externalId });
+    } catch (err) {
+      if (isProviderNotFound(err)) {
+        // describeError, not String(err): the SDK rejects with a plain object,
+        // so String(err) would render "[object Object]" and lose `cause`.
+        // Serializing HERE is what keeps the raw MP payload from travelling
+        // outward — PaymentNotFoundError carries a string, not the object.
+        throw new PaymentNotFoundError(externalId, describeError(err));
+      }
+      throw err;
+    }
 
     return {
       status: result.status ?? 'unknown',

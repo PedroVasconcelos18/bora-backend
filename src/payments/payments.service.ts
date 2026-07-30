@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service';
+import { PaymentNotFoundError } from './errors/payment-not-found.error';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
 import { describeError } from './utils/describe-error.util';
 import { verifyMpSignature } from './utils/verify-signature.util';
@@ -275,17 +276,87 @@ export class PaymentsService {
    * (safe against MP's webhook retries / double delivery). A dataId with no
    * matching Payment row is logged and ignored — it never fabricates a
    * participant or payment.
+   *
+   * ACK vs RETRY (#3, 30/07/2026). Mercado Pago redelivers on ANY non-200, so
+   * whether this method returns or throws IS the retry decision. The rule,
+   * stated once:
+   *
+   *   RETURN (=> 200, stop retrying) only when a retry provably cannot help:
+   *     - the provider itself denies the id (PaymentNotFoundError)
+   *     - we have no local row for it (see the !existing branch)
+   *     - the payment is already APPROVED here, or confirmed not-yet-approved
+   *   THROW (=> non-200, please retry) for everything else — 5xx, timeout,
+   *     network, database. These are exactly the failures a redelivery fixes.
+   *
+   * The bug this replaces was the inverse of a swallow: a permanent 404 threw,
+   * became a 500, and MP retried it forever (observed 18:31:37 and 18:31:51).
+   * Note the asymmetry that makes narrow catching essential — acking a
+   * transient failure loses a real payment silently, so the catch below is
+   * keyed on ONE type and rethrows everything it does not recognize.
    */
   async handleWebhook(dataId: string, rawBody: unknown): Promise<HandleWebhookResult> {
-    const confirmed = await this.psp.getPayment(dataId);
+    let confirmed: { status: string; externalReference: string | null };
+
+    try {
+      confirmed = await this.psp.getPayment(dataId);
+    } catch (err) {
+      if (err instanceof PaymentNotFoundError) {
+        // PERMANENT. The provider does not have this id, so redelivering the
+        // same notification forever cannot change the answer — acknowledge and
+        // drop it. Nothing is written: an id the PSP disowns must never move
+        // local money state.
+        this.logger.warn(
+          `handleWebhook: provider has no payment for dataId=${dataId} — acknowledging and ignoring (a retry could never resolve it)`,
+        );
+        return { activated: false };
+      }
+
+      // TRANSIENT/UNKNOWN. Rethrow so the controller answers non-200 and MP
+      // redelivers. Mapped to a 503 rather than letting the raw rejection hit
+      // the global filter: the MP SDK rejects with a plain object, which the
+      // ExceptionsHandler renders unhelpfully, and describeError is what makes
+      // the real reason (`cause[0].code`) readable — same GAP 3 treatment
+      // createCashIn already applies.
+      this.logger.error(
+        `handleWebhook: psp.getPayment failed for dataId=${dataId} (answering non-200 so Mercado Pago retries): ${describeError(err)}`,
+      );
+      throw new ServiceUnavailableException('Não foi possível confirmar o pagamento agora.');
+    }
 
     const result = await this.prisma.$transaction(async (tx): Promise<HandleWebhookTxResult> => {
       const existing = await tx.payment.findUnique({ where: { externalId: dataId } });
 
       if (!existing) {
-        this.logger.warn(
-          `handleWebhook: no Payment row found for externalId=${dataId} — ignoring webhook`,
-        );
+        // #4 — webhook that arrives before (or without) our local INSERT.
+        //
+        // We still ACK. Answering non-200 to invite a redelivery was
+        // considered and rejected: we cannot tell "row not committed yet" from
+        // "row will never exist" at this instant, and the realistic source of
+        // an unknown external is a charge created against the SAME Mercado
+        // Pago account by ANOTHER environment (local dev via ngrok, staging).
+        // For those the row never appears, so inviting retries would rebuild
+        // the exact infinite-retry loop #3 just removed.
+        //
+        // Recovery is #2 instead: once our INSERT commits, the row sits
+        // PENDING, and the reconciliation sweep (now that it survives to
+        // completion) re-fetches it, sees `approved`, and replays it through
+        // this very method. Slower, but it cannot loop and it cannot lose.
+        //
+        // What DOES change here: severity. `approved` reaching an unknown
+        // external is money we have not credited; `pending` is the benign
+        // ordering blip actually observed in production (external
+        // 170356446929, `payment.created` landing before the INSERT).
+        // Logging both at warn is what made "losing an approved" invisible —
+        // the silence was the defect, not the ack.
+        if (confirmed.status === 'approved') {
+          this.logger.error(
+            `handleWebhook: APPROVED payment externalId=${dataId} has no local Payment row — acknowledged, NOT credited. If a row for it appears, the reconciliation sweep will replay it; if none ever appears this charge belongs to another environment on the same Mercado Pago account.`,
+          );
+        } else {
+          this.logger.warn(
+            `handleWebhook: no Payment row found for externalId=${dataId} (provider status=${confirmed.status}) — ignoring webhook`,
+          );
+        }
         return { activated: false, alreadyProcessed: false };
       }
 

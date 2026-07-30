@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHmac, randomUUID } from 'crypto';
+import { PaymentNotFoundError } from '../errors/payment-not-found.error';
 import {
   CreatePixChargeParams,
   IPaymentProvider,
@@ -97,12 +98,25 @@ export class FakePixAdapter implements IPaymentProvider, OnModuleDestroy {
     };
   }
 
+  /**
+   * Mirrors MercadoPagoAdapter's contract, including its failure mode: an id
+   * this adapter never issued throws `PaymentNotFoundError`, exactly as a
+   * Mercado Pago 404 does.
+   *
+   * It used to answer `{ status: 'unknown', externalReference: null }`, which
+   * was a lie dressed as data — 'unknown' is not a payment status, it is an
+   * absence. Worse, it made the fake DIVERGE from production on precisely the
+   * path that broke there (the reconciliation sweep read 'unknown' as a
+   * terminal status and cancelled the row instead of failing), so local runs
+   * could never reproduce the bug. The fake's whole value is being wrong in
+   * the same places the real thing is.
+   */
   async getPayment(externalId: string): Promise<{ status: string; externalReference: string | null }> {
     const charge = this.charges.get(externalId);
 
     if (!charge) {
       this.logger.warn(`getPayment: unknown fake externalId=${externalId}`);
-      return { status: 'unknown', externalReference: null };
+      throw new PaymentNotFoundError(externalId, 'FakePixAdapter never issued this charge');
     }
 
     return { status: charge.status, externalReference: charge.externalReference };
