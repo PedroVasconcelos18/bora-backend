@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Inject,
   Injectable,
   Logger,
@@ -61,7 +62,8 @@ export class PaymentsService {
    * Both the invitee accept-and-pay flow and the creator's "pagar minha
    * entrada" flow converge on this method (D-06). Charges are only accepted
    * while the challenge is WAITING (pitfall M4 — the prize pool is computed
-   * from the paid count, which must be locked once the challenge activates).
+   * from the paid count, which must be locked once the challenge activates)
+   * and only from a participant who has NOT paid yet (#1a, below).
    */
   async createCashIn(participantId: string, pixKey?: string): Promise<CashInResult> {
     const participant = await this.prisma.participant.findUnique({
@@ -71,6 +73,29 @@ export class PaymentsService {
 
     if (!participant) {
       throw new NotFoundException('Participante não encontrado.');
+    }
+
+    // #1a — an entry is collected exactly once. Observed in production on
+    // 30/07/2026: after the webhook marked participant 4bf8ee39 PAID, three
+    // more POSTs (screen remounts) each minted a NEW Mercado Pago charge and
+    // answered 201, leaving four simultaneously-valid QRs for one entry. V1
+    // has no automatic refund (D-10: manual cash-out, custody on the
+    // creator's account), so a second charge is money we cannot give back
+    // without human work — this refuses instead.
+    //
+    // The guard lives HERE and not in ParticipantsService.payEntry because
+    // createCashIn is the single point where a charge is actually created:
+    // both payEntry (creator) and InvitesService.acceptAndPay (invitee) call
+    // into it. Guarding a caller would leave the other path open.
+    //
+    // Checked before the challenge-status guard on purpose: "você já pagou"
+    // is the more truthful, more actionable answer for someone who has paid,
+    // even once the challenge has left WAITING.
+    if (participant.status === 'PAID') {
+      this.logger.warn(
+        `createCashIn: refused duplicate charge — participant ${participantId} is already PAID`,
+      );
+      throw new ConflictException('Sua entrada neste desafio já foi paga.');
     }
 
     if (participant.challenge.status !== 'WAITING') {
