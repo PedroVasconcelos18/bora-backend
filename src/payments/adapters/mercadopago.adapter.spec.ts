@@ -91,11 +91,77 @@ describe('MercadoPagoAdapter.getPayment — 404 normalization', () => {
     expect(detail).not.toBe('[object Object]');
   });
 
-  it('classifies on error:"not_found" even when the body carries no status field', async () => {
+  it('tolerates a stringified status — the body is untyped JSON, "404" and 404 are the same answer', async () => {
     const { adapter, get } = makeAdapter();
-    get.mockRejectedValue({ message: 'Payment not found', error: 'not_found' });
+    get.mockRejectedValue({ message: 'Payment not found', error: 'not_found', status: '404' });
 
     await expect(adapter.getPayment('ext-1')).rejects.toBeInstanceOf(PaymentNotFoundError);
+  });
+
+  it('classifies on the 404 alone, with no error:"not_found" field present', async () => {
+    const { adapter, get } = makeAdapter();
+    get.mockRejectedValue({ message: 'Payment not found', status: 404 });
+
+    // The HTTP status is the necessary AND sufficient signal. Requiring the
+    // `error` string too would make a 404 whose body shape shifts degrade into
+    // "transient", resurrecting #3's infinite retry loop.
+    await expect(adapter.getPayment('ext-1')).rejects.toBeInstanceOf(PaymentNotFoundError);
+  });
+
+  /**
+   * REVIEW BLOCKER (hardening cycle) — `error: 'not_found'` is NOT sufficient
+   * on its own.
+   *
+   * The shipped predicate accepted `body.error === 'not_found'` regardless of
+   * status, on the speculative rationale that "a transport that omits status
+   * still classifies correctly". No captured payload ever backed that leg, and
+   * Mercado Pago is widely reported to answer `"error":"not_found"` alongside
+   * NON-404 statuses — notably 401 for an invalid/expired/wrong-account token
+   * on GET /v1/payments/{id}.
+   *
+   * The cost is one-way and total. A misclassification makes BOTH consumers
+   * destroy money state irreversibly: the sweep writes CANCELLED (the row
+   * leaves the `status:'PENDING'` scan forever) and the webhook answers 200 (MP
+   * stops redelivering, so the notification is gone). A wrong-token window
+   * would mass-cancel every live PENDING charge and silently drop every
+   * `approved` that arrived during it, with no recovery once credentials are
+   * fixed. Production is running a TEST- token today with a swap to live
+   * pending, so this is a live hazard, not a thought experiment.
+   *
+   * The correct degradation for "cannot classify" is TRANSIENT: the sweep skips
+   * and retries next hour, the webhook answers non-200 and MP keeps the
+   * notification alive. Noisy, but nothing is destroyed.
+   */
+  it('a 401 carrying error:"not_found" is NOT a not-found — a bad token must never look like a missing payment', async () => {
+    const { adapter, get } = makeAdapter();
+    const badToken = { message: 'invalid_token', error: 'not_found', status: 401 };
+    get.mockRejectedValue(badToken);
+
+    const caught = await adapter.getPayment('ext-1').catch((err: unknown) => err);
+
+    expect(caught).not.toBeInstanceOf(PaymentNotFoundError);
+    expect(caught).toBe(badToken);
+  });
+
+  it('a status-less body carrying error:"not_found" is NOT a not-found — unclassifiable degrades to transient', async () => {
+    const { adapter, get } = makeAdapter();
+    const shapeless = { message: 'Payment not found', error: 'not_found' };
+    get.mockRejectedValue(shapeless);
+
+    // Deliberately the SAFE direction. Classifying this as not-found would let
+    // any transport-level failure that happens to carry the string permanently
+    // cancel a live charge; refusing to classify it costs only a retry.
+    const caught = await adapter.getPayment('ext-1').catch((err: unknown) => err);
+
+    expect(caught).not.toBeInstanceOf(PaymentNotFoundError);
+    expect(caught).toBe(shapeless);
+  });
+
+  it('a 500 carrying error:"not_found" is NOT a not-found either', async () => {
+    const { adapter, get } = makeAdapter();
+    get.mockRejectedValue({ message: 'internal_error', error: 'not_found', status: 500 });
+
+    await expect(adapter.getPayment('ext-1')).rejects.not.toBeInstanceOf(PaymentNotFoundError);
   });
 
   it('rethrows a 500 UNTOUCHED — a provider outage must stay transient, never become "not found"', async () => {
@@ -125,6 +191,18 @@ describe('MercadoPagoAdapter.getPayment — 404 normalization', () => {
     get.mockRejectedValue({ message: 'invalid_token', status: 401 });
 
     await expect(adapter.getPayment('ext-1')).rejects.not.toBeInstanceOf(PaymentNotFoundError);
+  });
+
+  it('a 200 body with NO status field throws a plain Error — absence is never encoded as a status string (NIT 10)', async () => {
+    const { adapter, get } = makeAdapter();
+    get.mockResolvedValue({ external_reference: 'participant-1' });
+
+    const caught = await adapter.getPayment('ext-1').catch((err: unknown) => err);
+
+    // `status: 'unknown'` would have been read as a TERMINAL status by the
+    // reconciliation sweep and cancelled the row. Throwing keeps it transient.
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(PaymentNotFoundError);
   });
 
   it('passes a successful lookup straight through', async () => {

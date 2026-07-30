@@ -19,21 +19,41 @@ import { describeError } from '../utils/describe-error.util';
  *      cause: [{ code: 2000 }] }`
  *
  * This predicate is the ONLY place in the codebase allowed to know that shape.
- * `status` is compared loosely against string and number because it comes from
- * an untyped JSON body, and `error === 'not_found'` is accepted as an
- * independent signal so a transport that omits `status` still classifies
- * correctly. Anything else is NOT a not-found and must keep propagating —
- * misclassifying a 500 as "not found" would make us permanently cancel a
- * payment that is merely temporarily unreachable.
+ *
+ * ONE necessary and sufficient signal: an HTTP 404 in the body's `status`.
+ * Compared loosely against string and number only because the body is untyped
+ * JSON — `'404'` and `404` are the same answer. Everything else, including a
+ * body that carries `error: 'not_found'` with any other status or with no
+ * status at all, is NOT classified.
+ *
+ * WHY SO NARROW (review hardening, 30/07/2026). The first version also accepted
+ * `body.error === 'not_found'` on its own, reasoning that a transport omitting
+ * `status` should still classify. No captured payload ever supported that, and
+ * Mercado Pago is reported to answer `"error":"not_found"` alongside non-404
+ * statuses — notably 401 for an invalid, expired, or wrong-account token on
+ * GET /v1/payments/{id}.
+ *
+ * The asymmetry is total and one-way. A false positive here is destructive in
+ * BOTH consumers at once: the reconciliation sweep writes CANCELLED (the row
+ * leaves the `status:'PENDING'` scan permanently) and the webhook answers 200
+ * (Mercado Pago stops redelivering, so the notification itself is gone). A
+ * single wrong-token window would mass-cancel every live PENDING charge and
+ * silently drop every `approved` that landed during it, unrecoverably, even
+ * after credentials are fixed.
+ *
+ * A false negative costs a retry. So "cannot classify" MUST mean "not a
+ * not-found": the sweep skips the row and re-checks next hour, the webhook
+ * answers non-200 and Mercado Pago keeps the notification alive. That is the
+ * behavior this code had BEFORE the 404 work, and it destroyed nothing.
  */
 function isProviderNotFound(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) {
     return false;
   }
 
-  const body = err as { status?: unknown; error?: unknown };
+  const { status } = err as { status?: unknown };
 
-  return body.status === 404 || body.status === '404' || body.error === 'not_found';
+  return status === 404 || status === '404';
 }
 
 /**
@@ -154,8 +174,26 @@ export class MercadoPagoAdapter implements IPaymentProvider {
       throw err;
     }
 
+    if (!result.status) {
+      // NIT 10 (review hardening). This used to answer `status: 'unknown'`,
+      // which the interface contract explicitly forbids: a status string is
+      // DATA, and callers legitimately read any non-pending, non-approved
+      // status as TERMINAL — so a status-less 200 body would have flowed
+      // straight into the sweep's terminal branch and been CANCELLED. Absence
+      // is not a status. Thrown as a plain Error (never PaymentNotFoundError)
+      // so it degrades to TRANSIENT: the sweep skips and retries, the webhook
+      // answers non-200 and Mercado Pago redelivers. Nothing is settled on a
+      // response we could not read.
+      this.logger.error(
+        `MercadoPagoAdapter: GET /v1/payments/${externalId} returned a body with no status field`,
+      );
+      throw new Error(
+        `MercadoPagoAdapter: Mercado Pago returned no status for externalId=${externalId}`,
+      );
+    }
+
     return {
-      status: result.status ?? 'unknown',
+      status: result.status,
       externalReference: result.external_reference ?? null,
     };
   }

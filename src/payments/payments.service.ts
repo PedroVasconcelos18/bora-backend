@@ -46,6 +46,24 @@ interface HandleWebhookTxResult {
 // D-08: each individual Pix cobrança (QR + copia-e-cola) expires in 30 minutes.
 const PIX_EXPIRATION_MINUTES = 30;
 
+/**
+ * How much life a stored cobrança must have LEFT to be worth handing back
+ * (NIT 8, review hardening).
+ *
+ * A bare `expiresAt > now` calls a QR with two seconds on it "reusable", and
+ * the user is handed a code that dies while they are switching to their bank
+ * app. Worse, it is a trap with no exit: pressing "Gerar novo QR" POSTs again,
+ * matches the same nearly-dead row, and returns it again until it finally
+ * expires.
+ *
+ * 60 seconds, and no more, is a deliberate compromise: a Pix scan-to-confirm
+ * takes well under a minute, and every second of margin is a second in which
+ * BOTH the old QR (still payable at Mercado Pago) and a freshly minted one are
+ * live. The duplicate-collection guard in handleWebhook makes that window
+ * survivable, but it should still be as small as it can be.
+ */
+const REUSE_MIN_REMAINING_MS = 60_000;
+
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
@@ -143,8 +161,10 @@ export class PaymentsService {
     //   2. qrCode IS NOT NULL   — rows written before the qr_code migration
     //                             have no stored QR; there is nothing to hand
     //                             back, so they must fall through (no backfill)
-    //   3. expiresAt > now      — an expired cobrança cannot be paid; handing
-    //                             it back would strand the user on a dead QR
+    //   3. expiresAt > now + 60s — an expired cobrança cannot be paid; handing
+    //                             it back would strand the user on a dead QR,
+    //                             and one about to expire strands them just as
+    //                             surely (see REUSE_MIN_REMAINING_MS)
     // Failing any leg is NOT an error — it just means "mint a new one". This
     // branch never throws, so legacy/expired rows degrade gracefully.
     //
@@ -172,14 +192,16 @@ export class PaymentsService {
         status: 'PENDING',
         qrCode: { not: null },
         qrCodeBase64: { not: null },
-        expiresAt: { gt: new Date() },
+        expiresAt: { gt: new Date(Date.now() + REUSE_MIN_REMAINING_MS) },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    // The `if` re-states legs 2 and 3 that the query already enforced: Prisma
+    // The `if` re-states the non-null legs the query already enforced: Prisma
     // types these columns as nullable no matter what the filter says, and this
-    // is the money path — a `null as string` must never reach the client.
+    // is the money path — a `null as string` must never reach the client. (The
+    // freshness leg is enforced by Postgres only; it is pinned by the test that
+    // asserts the exact `where` sent.)
     if (reusable?.qrCode && reusable.qrCodeBase64 && reusable.expiresAt) {
       this.logger.log(
         `createCashIn: reusing PENDING payment ${reusable.id} (external=${reusable.externalId}) for participant ${participantId} — no new charge created`,
@@ -282,11 +304,13 @@ export class PaymentsService {
    * stated once:
    *
    *   RETURN (=> 200, stop retrying) only when a retry provably cannot help:
-   *     - the provider itself denies the id (PaymentNotFoundError)
+   *     - the provider denies the id AND we hold no live (PENDING) charge under
+   *       it (PaymentNotFoundError — see the catch below)
    *     - we have no local row for it (see the !existing branch)
    *     - the payment is already APPROVED here, or confirmed not-yet-approved
    *   THROW (=> non-200, please retry) for everything else — 5xx, timeout,
-   *     network, database. These are exactly the failures a redelivery fixes.
+   *     network, database, and the one case a bare 404 hides: the provider
+   *     disowning a charge we ourselves created and still hold PENDING.
    *
    * The bug this replaces was the inverse of a swallow: a permanent 404 threw,
    * became a 500, and MP retried it forever (observed 18:31:37 and 18:31:51).
@@ -301,12 +325,47 @@ export class PaymentsService {
       confirmed = await this.psp.getPayment(dataId);
     } catch (err) {
       if (err instanceof PaymentNotFoundError) {
-        // PERMANENT. The provider does not have this id, so redelivering the
-        // same notification forever cannot change the answer — acknowledge and
-        // drop it. Nothing is written: an id the PSP disowns must never move
-        // local money state.
+        // The provider denies this id. Whether that is safe to acknowledge
+        // depends entirely on something the provider cannot tell us: do WE have
+        // a live charge under this id?
+        //
+        // The lookup is done HERE, in the catch, rather than ahead of the
+        // provider call — same decision, one query cheaper on the happy path,
+        // and a read taken slightly LATER is strictly safer: a row that commits
+        // between the provider call and this read is one we want to see.
+        const known = await this.prisma.payment.findUnique({
+          where: { externalId: dataId },
+          select: { id: true, status: true },
+        });
+
+        if (known?.status === 'PENDING') {
+          // DANGEROUS. This is a charge WE created and the provider now
+          // disowns — not a stranger's id. Acking here would throw away the
+          // one artifact that can still recover it: Mercado Pago's own
+          // redelivery. The realistic cause is a credential/account fault
+          // (token swapped, pointing at another MP account), which is
+          // repairable — and after repair a redelivery credits the payer.
+          //
+          // The cost is retry noise while the fault lasts, bounded by the
+          // reconciliation sweep: once it settles the row (or the breaker
+          // decides it must not), a later redelivery finds a non-PENDING row
+          // and acks. That is what keeps this from being #3's infinite loop.
+          this.logger.error(
+            `handleWebhook: provider denies externalId=${dataId} but we hold a PENDING payment ${known.id} for it — answering non-200 so Mercado Pago KEEPS redelivering. Do not treat as orphan debris: check MERCADOPAGO_ACCESS_TOKEN (account, test/live prefix).`,
+          );
+          throw new ServiceUnavailableException('Não foi possível confirmar o pagamento agora.');
+        }
+
+        // PERMANENT and SAFE. Either we never issued this id (the realistic
+        // case: a charge created on the same Mercado Pago account by another
+        // environment — local dev via ngrok, staging), or our row already
+        // reached a terminal state. Redelivering cannot change the answer, and
+        // nothing here can be lost — so acknowledge and drop it. Nothing is
+        // written: an id the PSP disowns must never move local money state.
         this.logger.warn(
-          `handleWebhook: provider has no payment for dataId=${dataId} — acknowledging and ignoring (a retry could never resolve it)`,
+          `handleWebhook: provider has no payment for dataId=${dataId} (local row: ${
+            known ? `${known.id} status=${known.status}` : 'none'
+          }) — acknowledging and ignoring (a retry could never resolve it)`,
         );
         return { activated: false };
       }
@@ -380,6 +439,47 @@ export class PaymentsService {
         return { activated: false, alreadyProcessed: false };
       }
 
+      // DOUBLE COLLECTION (review hardening, 30/07/2026). An entry is collected
+      // ONCE. If another payment for this participant already collected money,
+      // this approval is a second Pix for the same entry — the exact damage the
+      // four simultaneous QRs of 30/07/2026 could still cause, since those QRs
+      // remain payable at Mercado Pago no matter what we write locally.
+      //
+      // Crediting it again would re-mark the participant PAID and emit a second
+      // payment.confirmed, while the prize pool — computed from the PAID
+      // participant COUNT — would never grow by a centavo. The money would sit
+      // in the creator's account belonging to nobody, in no queue.
+      //
+      // So it is booked as REFUND_PENDING instead: that status IS the manual
+      // refund queue an operator works from (D-10, AdminService.listRefunds),
+      // with a legible pt-BR reason. REFUND_PENDING is included in the lookup
+      // because it means money WAS collected — a challenge cancelled between
+      // the two payments must not open a second crediting window.
+      const alreadyCollected = await tx.payment.findFirst({
+        where: {
+          participantId: existing.participantId,
+          status: { in: ['APPROVED', 'REFUND_PENDING'] },
+          id: { not: existing.id },
+        },
+        select: { id: true },
+      });
+
+      if (alreadyCollected) {
+        await tx.payment.update({
+          where: { id: existing.id },
+          data: {
+            status: 'REFUND_PENDING',
+            refundReason: 'Cobrança Pix duplicada — a entrada deste participante já havia sido paga.',
+          },
+        });
+
+        this.logger.error(
+          `handleWebhook: DUPLICATE COLLECTION — payment ${existing.id} (externalId=${dataId}) approved, but payment ${alreadyCollected.id} already collected this participant's entry. Booked as REFUND_PENDING (manual refund queue); participant NOT re-credited and no second payment.confirmed emitted.`,
+        );
+
+        return { activated: false, alreadyProcessed: true };
+      }
+
       await tx.payment.update({
         where: { id: existing.id },
         data: { status: 'APPROVED', paidAt: new Date() },
@@ -389,6 +489,32 @@ export class PaymentsService {
         where: { id: existing.participantId },
         data: { status: 'PAID', paidAt: new Date() },
       });
+
+      // Kill every OTHER live cobrança for this same entry, now that one of
+      // them has been paid. Scoped as narrowly as a money write can be: same
+      // participant AND same challenge, still PENDING, and explicitly never the
+      // row being approved. A CANCELLED sibling can no longer be handed back by
+      // the #1b reuse branch (it requires PENDING), and if one is paid anyway
+      // the duplicate-collection guard above catches it.
+      //
+      // LOCAL HALF ONLY — see the note on this method's limits: the QR itself
+      // stays payable at Mercado Pago until it expires. Voiding it there needs
+      // a provider-side cancel this adapter does not implement.
+      const siblings = await tx.payment.updateMany({
+        where: {
+          participantId: existing.participantId,
+          challengeId: existing.challengeId,
+          status: 'PENDING',
+          id: { not: existing.id },
+        },
+        data: { status: 'CANCELLED' },
+      });
+
+      if (siblings.count > 0) {
+        this.logger.warn(
+          `handleWebhook: cancelled ${siblings.count} other PENDING cobrança(s) for participant ${existing.participantId} after payment ${existing.id} was approved — their QRs stay payable at Mercado Pago until they expire (30 min), but a payment on one would now land in the refund queue instead of double-crediting`,
+        );
+      }
 
       const activated = await this.tryActivateChallenge(tx, existing.challengeId);
 
