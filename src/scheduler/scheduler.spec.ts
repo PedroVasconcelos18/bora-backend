@@ -8,6 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { PaymentsService } from '../payments/payments.service';
 import { VotingService } from '../voting/voting.service';
 import { IPaymentProvider } from '../payments/interfaces/payment-provider.interface';
+import { PaymentNotFoundError } from '../payments/errors/payment-not-found.error';
 import { NotificationsListener } from '../notifications/notifications.listener';
 import { NotificationsService } from '../notifications/notifications.service';
 import { saoPauloDay } from '../common/utils/sao-paulo-day.util';
@@ -110,6 +111,166 @@ describe('ReconciliationJob (PAY-04, D-16)', () => {
     await job.run();
 
     expect(paymentsService.handleWebhook).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * #2 — fault isolation.
+   *
+   * Production, 30/07/2026: `[Scheduler] ERROR ... 'Payment not found'` every
+   * hour and NOT ONE `reconciliation: found=...` line all day. The sweep had
+   * no error handling, so the first orphan row threw out of the loop and the
+   * job never completed — one dead row disabling reconciliation for every
+   * other payment in the system.
+   *
+   * The ordering in these tests is deliberate: the failing row comes FIRST,
+   * because a fix that only survives a failure on the LAST item proves
+   * nothing.
+   */
+  describe('#2 — one bad row must never abort the sweep', () => {
+    const orphan = {
+      id: 'payment-orphan',
+      externalId: 'mp-ext-orphan',
+      status: 'PENDING',
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
+    };
+    const healthy = {
+      id: 'payment-healthy',
+      externalId: 'mp-ext-healthy',
+      status: 'PENDING',
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
+    };
+
+    /** Orphan first, healthy second. */
+    const bothRows = () => prisma.payment.findMany.mockResolvedValue([orphan, healthy]);
+
+    it('processes BOTH rows and completes when the FIRST one 404s at the provider', async () => {
+      bothRows();
+      const logSpy = jest.spyOn(job['logger'], 'log');
+      psp.getPayment.mockImplementation(async (externalId: string) => {
+        if (externalId === 'mp-ext-orphan') {
+          throw new PaymentNotFoundError(externalId, 'not_found code 2000');
+        }
+        return { status: 'approved', externalReference: 'participant-1' };
+      });
+
+      await job.run();
+
+      // Both were visited — the loop did not stop at the orphan.
+      expect(psp.getPayment).toHaveBeenCalledWith('mp-ext-orphan');
+      expect(psp.getPayment).toHaveBeenCalledWith('mp-ext-healthy');
+      // And the healthy one was actually reconciled, not merely visited.
+      expect(paymentsService.handleWebhook).toHaveBeenCalledWith('mp-ext-healthy', expect.any(Object));
+      // The orphan was settled, not just skipped.
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'payment-orphan' },
+        data: { status: 'CANCELLED' },
+      });
+      // ...and the run REACHED THE END. Asserting the completion line matters
+      // as much as the two assertions above: production's tell was not an
+      // error in the log, it was the absence of this line.
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('reconciliation: found=2 updated=2 failed=0'),
+      );
+    });
+
+    it('marks a 404 row CANCELLED so it permanently leaves the PENDING scan', async () => {
+      prisma.payment.findMany.mockResolvedValue([orphan]);
+      psp.getPayment.mockRejectedValue(new PaymentNotFoundError('mp-ext-orphan', 'detail'));
+
+      await job.run();
+
+      expect(prisma.payment.update).toHaveBeenCalledWith({
+        where: { id: 'payment-orphan' },
+        data: { status: 'CANCELLED' },
+      });
+      // An id the provider disowns never collected money — it must not be
+      // replayed through the approval path.
+      expect(paymentsService.handleWebhook).not.toHaveBeenCalled();
+    });
+
+    it('always emits the completion line — even when EVERY item fails', async () => {
+      bothRows();
+      const logSpy = jest.spyOn(job['logger'], 'log');
+      psp.getPayment.mockRejectedValue(new Error('provider unreachable'));
+
+      await job.run();
+
+      // The absence of this line in production was the evidence the job was
+      // dying mid-sweep, so it doubles as this cron's liveness signal.
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('reconciliation: found=2'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('failed=2'));
+    });
+
+    it('a TRANSIENT failure (5xx/timeout) leaves the row PENDING — never cancelled — so the next run retries it', async () => {
+      prisma.payment.findMany.mockResolvedValue([orphan]);
+      psp.getPayment.mockRejectedValue(new Error('socket hang up'));
+
+      await job.run();
+
+      // The critical asymmetry: a provider that is merely DOWN must not cost
+      // a payer their charge. Only a positive "I do not have it" cancels.
+      expect(prisma.payment.update).not.toHaveBeenCalled();
+      expect(paymentsService.handleWebhook).not.toHaveBeenCalled();
+    });
+
+    it('survives a failure in the WRITE path too, not just the provider lookup', async () => {
+      bothRows();
+      psp.getPayment.mockResolvedValue({ status: 'cancelled', externalReference: null });
+      prisma.payment.update
+        .mockRejectedValueOnce(new Error('deadlock detected'))
+        .mockResolvedValue({});
+
+      await job.run();
+
+      // Isolation wraps the whole item, not just getPayment: the second row is
+      // still written even though the first row's UPDATE blew up.
+      expect(prisma.payment.update).toHaveBeenCalledTimes(2);
+      expect(prisma.payment.update).toHaveBeenLastCalledWith({
+        where: { id: 'payment-healthy' },
+        data: { status: 'CANCELLED' },
+      });
+    });
+
+    it('survives a failure inside handleWebhook on the approved path', async () => {
+      bothRows();
+      psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+      paymentsService.handleWebhook
+        .mockRejectedValueOnce(new Error('challenge activation blew up'))
+        .mockResolvedValue({ activated: false });
+
+      await job.run();
+
+      expect(paymentsService.handleWebhook).toHaveBeenCalledTimes(2);
+      expect(paymentsService.handleWebhook).toHaveBeenLastCalledWith(
+        'mp-ext-healthy',
+        expect.any(Object),
+      );
+    });
+
+    it('run() itself never rejects, whatever the items do — an unhandled rejection would kill the scheduler tick', async () => {
+      bothRows();
+      psp.getPayment.mockRejectedValue(new PaymentNotFoundError('x', 'y'));
+      prisma.payment.update.mockRejectedValue(new Error('db down'));
+
+      await expect(job.run()).resolves.toBeUndefined();
+    });
+
+    it('counts only rows it actually changed: 1 orphan cancelled + 1 still-pending = updated=1', async () => {
+      bothRows();
+      const logSpy = jest.spyOn(job['logger'], 'log');
+      psp.getPayment.mockImplementation(async (externalId: string) => {
+        if (externalId === 'mp-ext-orphan') {
+          throw new PaymentNotFoundError(externalId, 'detail');
+        }
+        return { status: 'pending', externalReference: null };
+      });
+
+      await job.run();
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('found=2 updated=1 failed=0'),
+      );
+    });
   });
 });
 

@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { FakePixAdapter } from './fake-pix.adapter';
+import { PaymentNotFoundError } from '../errors/payment-not-found.error';
 import { verifyMpSignature } from '../utils/verify-signature.util';
 
 describe('FakePixAdapter', () => {
@@ -80,12 +81,19 @@ describe('FakePixAdapter', () => {
     });
   });
 
-  it('getPayment for an unknown externalId returns unknown/null and never fabricates approved', async () => {
+  it('getPayment for an unknown externalId throws PaymentNotFoundError — same contract as a real MP 404 — and never fabricates approved', async () => {
     const adapter = makeAdapter();
 
-    const result = await adapter.getPayment('fake-does-not-exist');
+    // It used to resolve `{ status: 'unknown', externalReference: null }`.
+    // That made the fake diverge from production on exactly the path that
+    // broke there: callers treat any non-pending/non-approved status as
+    // TERMINAL, so the reconciliation sweep would have quietly cancelled the
+    // row locally instead of surfacing the lookup failure. A fake that cannot
+    // reproduce the production failure mode is worse than no fake.
+    const caught = await adapter.getPayment('fake-does-not-exist').catch((err: unknown) => err);
 
-    expect(result).toEqual({ status: 'unknown', externalReference: null });
+    expect(caught).toBeInstanceOf(PaymentNotFoundError);
+    expect((caught as PaymentNotFoundError).externalId).toBe('fake-does-not-exist');
   });
 
   it('POSTs the self-triggered webhook to the configured URL with data.id in the query', async () => {

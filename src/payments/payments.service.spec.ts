@@ -12,6 +12,7 @@ import { PaymentsService } from './payments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { IPaymentProvider, PixChargeResult } from './interfaces/payment-provider.interface';
 import { MercadoPagoAdapter } from './adapters/mercadopago.adapter';
+import { PaymentNotFoundError } from './errors/payment-not-found.error';
 
 /** The Payment columns the #1b reuse path reads. */
 interface StoredPayment {
@@ -714,6 +715,157 @@ describe('PaymentsService', () => {
       const result = await service.handleWebhook('mp-external-id-123', {});
 
       expect(result).toEqual({ activated: true });
+    });
+
+    /**
+     * #3 — ack vs retry.
+     *
+     * Mercado Pago redelivers on ANY non-200, so "does handleWebhook return or
+     * throw" IS the retry decision. Both directions are tested here because
+     * each failure mode is dangerous in the opposite way:
+     *
+     *   - acking a TRANSIENT failure loses a real payment, silently and forever
+     *   - throwing on a PERMANENT 404 makes MP retry forever (what production
+     *     did at 18:31:37 and 18:31:51 — the 404 became a 500)
+     *
+     * A blanket try/catch would fix the second by causing the first. Hence a
+     * catch keyed on exactly one type.
+     */
+    describe('#3 — a 404 is acknowledged; every other provider failure is not', () => {
+      it('PERMANENT (PaymentNotFoundError): returns normally so the controller answers 200 and MP stops retrying', async () => {
+        psp.getPayment.mockRejectedValue(new PaymentNotFoundError('170356446929', 'code 2000'));
+
+        await expect(service.handleWebhook('170356446929', {})).resolves.toEqual({
+          activated: false,
+        });
+      });
+
+      it('PERMANENT: writes nothing — an id the provider disowns must never move local money state', async () => {
+        psp.getPayment.mockRejectedValue(new PaymentNotFoundError('170356446929', 'code 2000'));
+
+        await service.handleWebhook('170356446929', {});
+
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(tx.payment.update).not.toHaveBeenCalled();
+        expect(tx.participant.update).not.toHaveBeenCalled();
+        expect(eventEmitter.emit).not.toHaveBeenCalled();
+      });
+
+      it('TRANSIENT (5xx): THROWS, so the controller answers non-200 and Mercado Pago DOES retry', async () => {
+        psp.getPayment.mockRejectedValue({ message: 'internal_error', status: 500 });
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).rejects.toBeInstanceOf(
+          ServiceUnavailableException,
+        );
+      });
+
+      it('TRANSIENT (timeout): THROWS — a redelivery is exactly what fixes this', async () => {
+        psp.getPayment.mockRejectedValue(new Error('The operation was aborted'));
+
+        await expect(service.handleWebhook('mp-external-id-123', {})).rejects.toBeInstanceOf(
+          ServiceUnavailableException,
+        );
+      });
+
+      it('TRANSIENT: the 503 body is generic — MP internals never reach the wire (GAP 3)', async () => {
+        psp.getPayment.mockRejectedValue({
+          message: 'invalid access token',
+          status: 401,
+          cause: [{ code: 2001, description: 'secret leak' }],
+        });
+
+        const caught = await service
+          .handleWebhook('mp-external-id-123', {})
+          .catch((err: unknown) => err);
+
+        expect((caught as ServiceUnavailableException).message).toBe(
+          'Não foi possível confirmar o pagamento agora.',
+        );
+        expect(JSON.stringify(caught)).not.toContain('secret leak');
+      });
+
+      it('TRANSIENT: nothing is written before the throw — no half-applied state on a retry', async () => {
+        psp.getPayment.mockRejectedValue({ message: 'internal_error', status: 500 });
+
+        await service.handleWebhook('mp-external-id-123', {}).catch(() => undefined);
+
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(eventEmitter.emit).not.toHaveBeenCalled();
+      });
+    });
+
+    /**
+     * #4 — webhook arriving before (or without) our local INSERT.
+     *
+     * We keep acking, because at this instant "row not committed yet" and "row
+     * will never exist" are indistinguishable, and the realistic source of an
+     * unknown external is a charge created against the same Mercado Pago
+     * account by another environment — for which retries would never converge.
+     * Recovery belongs to #2: once the row commits it sits PENDING and the
+     * sweep (which now survives to completion) replays it through this method.
+     *
+     * So what is actually fixed here is the SILENCE. A lost `approved` and a
+     * benign out-of-order `pending` used to log identically.
+     */
+    describe('#4 — an unknown external is acked, but an approved one is never silent', () => {
+      it('logs at ERROR when the unknown external is APPROVED — money we have not credited', async () => {
+        const errorSpy = jest.spyOn(service['logger'], 'error');
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-9' });
+        tx.payment.findUnique.mockResolvedValue(null);
+
+        await service.handleWebhook('external-never-inserted', {});
+
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining('external-never-inserted'),
+        );
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('NOT credited'));
+      });
+
+      it('stays at WARN for the benign out-of-order pending notification (the case actually observed)', async () => {
+        const errorSpy = jest.spyOn(service['logger'], 'error');
+        const warnSpy = jest.spyOn(service['logger'], 'warn');
+        psp.getPayment.mockResolvedValue({ status: 'pending', externalReference: 'participant-9' });
+        tx.payment.findUnique.mockResolvedValue(null);
+
+        await service.handleWebhook('170356446929', {});
+
+        // `payment.created` landing before our INSERT commits is routine noise,
+        // not an incident. Escalating it would train everyone to ignore the
+        // ERROR above, which is the one that matters.
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('170356446929'));
+      });
+
+      it('still acks (200) and still writes nothing, approved or not', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-9' });
+        tx.payment.findUnique.mockResolvedValue(null);
+
+        await expect(service.handleWebhook('external-never-inserted', {})).resolves.toEqual({
+          activated: false,
+        });
+        expect(tx.participant.update).not.toHaveBeenCalled();
+        expect(tx.payment.update).not.toHaveBeenCalled();
+        expect(eventEmitter.emit).not.toHaveBeenCalled();
+      });
+
+      it('the #2 sweep can replay it later: once the row exists, the SAME dataId credits normally', async () => {
+        psp.getPayment.mockResolvedValue({ status: 'approved', externalReference: 'participant-1' });
+
+        // First delivery — INSERT has not committed yet.
+        tx.payment.findUnique.mockResolvedValueOnce(null);
+        await service.handleWebhook('mp-external-id-123', {});
+        expect(tx.participant.update).not.toHaveBeenCalled();
+
+        // Later: the row exists, and reconciliation replays the same external
+        // through this very method (that is how ReconciliationJob approves).
+        tx.payment.findUnique.mockResolvedValueOnce(existingPayment);
+        await service.handleWebhook('mp-external-id-123', { reconciled: true });
+
+        expect(tx.participant.update).toHaveBeenCalledWith({
+          where: { id: 'participant-1' },
+          data: { status: 'PAID', paidAt: expect.any(Date) },
+        });
+      });
     });
   });
 
