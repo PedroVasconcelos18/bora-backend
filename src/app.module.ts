@@ -18,6 +18,7 @@ import { RankingModule } from './ranking/ranking.module';
 import { ProfileModule } from './profile/profile.module';
 import { FinalizationModule } from './finalization/finalization.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { PushModule } from './push/push.module';
 
 @Module({
   imports: [
@@ -44,6 +45,10 @@ import { NotificationsModule } from './notifications/notifications.module';
     // themselves. NotificationsModule is the only listener.
     EventEmitterModule.forRoot(),
     NotificationsModule,
+    // Second, independent consumer of the 'evidence.reminder' event on this
+    // same globally-registered event bus — the in-app notifications
+    // listener above stays untouched (SC-3).
+    PushModule,
   ],
 })
 export class AppModule {}
