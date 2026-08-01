@@ -1,0 +1,110 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { IPushProvider } from './interfaces/push-provider.interface';
+import { PushService } from './push.service';
+import { PrismaService } from '../prisma/prisma.service';
+
+/**
+ * PushSenderService — turns the `evidence.reminder` event (via PushListener)
+ * into an actual web-push send, and nothing else (D-04 — the phase's
+ * sharpest product cut: this class must never learn the name of any other
+ * notification type; adding one here would be the exact mistake D-04
+ * exists to prevent).
+ *
+ * Injects the push transport by DI token only, never the concrete
+ * `WebPushAdapter` — D-02, mirrors `EmailModule`'s
+ * `'EMAIL_PROVIDER'` convention), plus `PushService` (the only door to
+ * `push_subscriptions`/`notification_preferences` — D-08) and
+ * `PrismaService` (the single `challenge.title` lookup the 1-pending-challenge
+ * body needs).
+ *
+ * `sendEvidenceReminder` never rejects: every per-subscription send runs
+ * inside its own try/catch (mirrors `invites.service.ts`'s `dispatchInvites`),
+ * so one dead device never stops the rest of a person's subscriptions from
+ * being tried (D-03's fire-and-forget discipline, T-11-14).
+ */
+@Injectable()
+export class PushSenderService {
+  private readonly logger = new Logger(PushSenderService.name);
+
+  constructor(
+    @Inject('PUSH_PROVIDER') private readonly push: IPushProvider,
+    private readonly pushService: PushService,
+    private readonly prisma: PrismaService,
+  ) {}
+
+  /**
+   * `challengeIds` is whatever `PushListener` coalesced for this user/day —
+   * one entry when the person has exactly one pending challenge, more than
+   * one when several fired inside the same coalescing window (Discretion #1).
+   */
+  async sendEvidenceReminder(
+    userId: string,
+    evidenceDate: string,
+    challengeIds: string[],
+  ): Promise<void> {
+    // Step 1 — the SC-2 gate. Eligibility for *who gets a reminder at all*
+    // stays entirely the untouched cron's call; this only decides whether
+    // that person also wanted it on their phone.
+    const targets = await this.pushService.getReminderTargets(userId);
+    if (!targets.enabled || targets.subscriptions.length === 0) {
+      return;
+    }
+
+    const uniqueChallengeIds = [...new Set(challengeIds)];
+
+    let body: string;
+    let url: string;
+
+    if (uniqueChallengeIds.length === 1) {
+      const challenge = await this.prisma.challenge.findUnique({
+        where: { id: uniqueChallengeIds[0] },
+        select: { title: true },
+      });
+      // Same defensive shape as the in-app listener: a challenge that no
+      // longer exists by send time means nothing to point the tap at.
+      if (!challenge) {
+        return;
+      }
+
+      body = `Falta a sua evidência de hoje no ${challenge.title}`;
+      url = `/challenges/${uniqueChallengeIds[0]}`;
+    } else {
+      body = `Você tem ${uniqueChallengeIds.length} desafios esperando evidência hoje`;
+      url = '/home';
+    }
+
+    const payload = {
+      // Camera emoji from EMOJI_BY_TYPE, plain "Bora" — bora-frontend/src/lib/notifications.ts:46.
+      title: '📸 Bora',
+      body,
+      url,
+      // Same-day repeat collapses instead of stacking on the lock screen.
+      tag: `evidence-reminder-${evidenceDate}`,
+      // No `actions` — iOS/Android disagree on action-button support and
+      // SC-1 needs both platforms identical (11-UI-SPEC.md).
+    };
+
+    // Step 3 — send and prune. Per-subscription try/catch: the same
+    // per-item resilience the cron's own loop has (T-11-14).
+    for (const subscription of targets.subscriptions) {
+      try {
+        await this.push.send({
+          endpoint: subscription.endpoint,
+          keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+          payload,
+        });
+      } catch (err) {
+        const statusCode = (err as { statusCode?: number }).statusCode;
+        if (statusCode === 404 || statusCode === 410) {
+          // D-09 — the only signal a dead subscription ever emits; on iOS
+          // the only way to learn the home-screen icon was deleted.
+          await this.pushService.pruneSubscription(subscription.id);
+          continue;
+        }
+        this.logger.warn(
+          `Push send failed for subscription ${subscription.id} (status=${statusCode ?? 'unknown'}): ${String(err)}`,
+        );
+      }
+    }
+  }
+}
