@@ -1,7 +1,11 @@
 import { Module } from '@nestjs/common';
 import { WebPushAdapter } from './adapters/web-push.adapter';
 import { PushController } from './push.controller';
+import { PushAdminController } from './push-admin.controller';
 import { PushService } from './push.service';
+import { PushSenderService } from './push-sender.service';
+import { PushListener } from './push.listener';
+import { AdminGuard } from '../admin/admin.guard';
 
 /**
  * PushModule binds the 'PUSH_PROVIDER' token to WebPushAdapter.
@@ -11,19 +15,28 @@ import { PushService } from './push.service';
  * Pago and email (Resend): swapping push mechanisms means swapping the
  * adapter, not callers.
  *
- * The controller registered below exposes the D-08 subscription/preference
- * endpoints; PushService is exported so the Plan 11-04 listener can inject
- * it directly for getReminderTargets/pruneSubscription without touching
- * Prisma itself.
+ * The subscription/preference endpoints stay on the controller registered
+ * below; the admin-only manual-trigger route lives on a second controller
+ * (Discretion #5). PushSenderService and the event listener registered
+ * below are the Plan 11-04 pair that turns `evidence.reminder` into an
+ * actual send — the listener needs no export, like the in-app listener it
+ * is discovered automatically by the event-emitter's provider scan. The
+ * guard is registered here too
+ * because Nest resolves a class-referenced guard from the host module's own
+ * injector, and it otherwise only lives in AdminModule. PushService remains
+ * exported alongside 'PUSH_PROVIDER' as earlier plans left it.
  */
 @Module({
-  controllers: [PushController],
+  controllers: [PushController, PushAdminController],
   providers: [
     {
       provide: 'PUSH_PROVIDER',
       useClass: WebPushAdapter,
     },
     PushService,
+    PushSenderService,
+    PushListener,
+    AdminGuard,
   ],
   exports: ['PUSH_PROVIDER', PushService],
 })
