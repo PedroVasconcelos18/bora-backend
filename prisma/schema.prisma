@@ -13,42 +13,44 @@ datasource db {
 }
 
 model User {
-  id                  String                @id @default(uuid())
-  email               String                @unique
-  name                String
-  passwordHash        String                @map("password_hash")
-  createdAt           DateTime              @default(now()) @map("created_at")
+  id                     String                  @id @default(uuid())
+  email                  String                  @unique
+  name                   String
+  passwordHash           String                  @map("password_hash")
+  createdAt              DateTime                @default(now()) @map("created_at")
   // Legacy single "primary" Pix key — kept in sync with pixKeys[0] so the
   // payout/refund fallback (participant.pixKey ?? user.pixKey) is untouched.
-  pixKey              String?               @map("pix_key")
+  pixKey                 String?                 @map("pix_key")
   // Up to 5 saved Pix keys (feedback: múltiplas chaves). Source of truth for
   // the profile editor + the pay-time dropdown; pixKey mirrors the first one.
-  pixKeys             String[]              @default([]) @map("pix_keys")
-  refreshTokens       RefreshToken[]
-  passwordResetTokens PasswordResetToken[]
-  participants        Participant[]
-  challenges          Challenge[]           @relation("CreatedChallenges")
-  notifications       Notification[]
+  pixKeys                String[]                @default([]) @map("pix_keys")
+  refreshTokens          RefreshToken[]
+  passwordResetTokens    PasswordResetToken[]
+  participants           Participant[]
+  challenges             Challenge[]             @relation("CreatedChallenges")
+  notifications          Notification[]
+  pushSubscriptions      PushSubscription[]
+  notificationPreference NotificationPreference?
 
   @@map("users")
 }
 
 model Challenge {
-  id            String          @id @default(uuid())
-  title         String
-  emoji         String
-  durationDays  Int             @map("duration_days")
-  collabAmount  Decimal         @map("collab_amount") @db.Decimal(10, 2)
-  platformFee   Decimal         @default(10) @map("platform_fee") @db.Decimal(10, 2)
-  status        ChallengeStatus @default(WAITING)
-  creatorId     String          @map("creator_id")
-  creator       User            @relation("CreatedChallenges", fields: [creatorId], references: [id])
-  participants  Participant[]
-  invites       Invite[]
-  payments      Payment[]
-  evidences     Evidence[]
-  createdAt     DateTime        @default(now()) @map("created_at")
-  startsAt      DateTime?       @map("starts_at")
+  id           String          @id @default(uuid())
+  title        String
+  emoji        String
+  durationDays Int             @map("duration_days")
+  collabAmount Decimal         @map("collab_amount") @db.Decimal(10, 2)
+  platformFee  Decimal         @default(10) @map("platform_fee") @db.Decimal(10, 2)
+  status       ChallengeStatus @default(WAITING)
+  creatorId    String          @map("creator_id")
+  creator      User            @relation("CreatedChallenges", fields: [creatorId], references: [id])
+  participants Participant[]
+  invites      Invite[]
+  payments     Payment[]
+  evidences    Evidence[]
+  createdAt    DateTime        @default(now()) @map("created_at")
+  startsAt     DateTime?       @map("starts_at")
 
   @@map("challenges")
 }
@@ -88,16 +90,16 @@ model Invite {
 }
 
 enum ChallengeStatus {
-  WAITING    // aguardando turma
-  ACTIVE     // no ar (Phase 2+)
-  FINISHED   // finalizado (Phase 4+)
-  CANCELLED  // cancelado (Phase 2+)
+  WAITING // aguardando turma
+  ACTIVE // no ar (Phase 2+)
+  FINISHED // finalizado (Phase 4+)
+  CANCELLED // cancelado (Phase 2+)
 }
 
 enum ParticipantStatus {
   INVITED
-  PAID    // Phase 2
-  ACTIVE  // Phase 2
+  PAID // Phase 2
+  ACTIVE // Phase 2
 }
 
 enum InviteStatus {
@@ -151,18 +153,18 @@ enum PaymentStatus {
 }
 
 model Evidence {
-  id                String        @id @default(uuid())
-  challengeId       String        @map("challenge_id")
-  challenge         Challenge     @relation(fields: [challengeId], references: [id])
-  participantId     String        @map("participant_id")
-  participant       Participant   @relation(fields: [participantId], references: [id])
-  objectKey         String        @map("object_key")
-  evidenceDate      String        @map("evidence_date")
-  status            EvidenceStatus @default(PENDING)
-  windowClosesAt    DateTime      @map("window_closes_at")
-  postedAt          DateTime      @default(now()) @map("posted_at")
-  resolvedAt        DateTime?     @map("resolved_at")
-  votes             Vote[]
+  id             String         @id @default(uuid())
+  challengeId    String         @map("challenge_id")
+  challenge      Challenge      @relation(fields: [challengeId], references: [id])
+  participantId  String         @map("participant_id")
+  participant    Participant    @relation(fields: [participantId], references: [id])
+  objectKey      String         @map("object_key")
+  evidenceDate   String         @map("evidence_date")
+  status         EvidenceStatus @default(PENDING)
+  windowClosesAt DateTime       @map("window_closes_at")
+  postedAt       DateTime       @default(now()) @map("posted_at")
+  resolvedAt     DateTime?      @map("resolved_at")
+  votes          Vote[]
 
   @@unique([participantId, evidenceDate])
   @@index([status, windowClosesAt])
@@ -176,13 +178,13 @@ enum EvidenceStatus {
 }
 
 model Vote {
-  id            String      @id @default(uuid())
-  evidenceId    String      @map("evidence_id")
-  evidence      Evidence    @relation(fields: [evidenceId], references: [id])
-  voterId       String      @map("voter_id")
-  voter         Participant @relation(fields: [voterId], references: [id])
-  value         VoteValue
-  createdAt     DateTime    @default(now()) @map("created_at")
+  id         String      @id @default(uuid())
+  evidenceId String      @map("evidence_id")
+  evidence   Evidence    @relation(fields: [evidenceId], references: [id])
+  voterId    String      @map("voter_id")
+  voter      Participant @relation(fields: [voterId], references: [id])
+  value      VoteValue
+  createdAt  DateTime    @default(now()) @map("created_at")
 
   @@unique([evidenceId, voterId])
   @@map("votes")
@@ -242,4 +244,36 @@ enum NotificationType {
   CHALLENGE_CANCELLED
   CHALLENGE_ACTIVATED
   EVIDENCE_REJECTED
+}
+
+// D-08: one device subscription per row, N per user — a phone and a tablet
+// are two independent rows, and either one can be deleted without touching
+// the other. endpoint is unique because it belongs to exactly one row, same
+// idea as RefreshToken.tokenHash.
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id])
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+// D-08: "quero lembrete" is exactly 1 row per user, separate from the
+// per-device subscription above — it survives a phone swap. Deliberately a
+// single boolean column, not a per-type preference table (NOTIF-06 stays
+// deferred, CONTEXT.md Discretion #3).
+model NotificationPreference {
+  id                   String   @id @default(uuid())
+  userId               String   @unique @map("user_id")
+  user                 User     @relation(fields: [userId], references: [id])
+  pushRemindersEnabled Boolean  @default(false) @map("push_reminders_enabled")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_preferences")
 }
