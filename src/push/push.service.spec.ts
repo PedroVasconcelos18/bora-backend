@@ -193,17 +193,6 @@ describe('PushService (D12-07 per-type preference — T-11-07/08/09, T-12-09/10/
     });
   });
 
-  describe('getReminderTargets (temporary bridge for PushSenderService, Plan 12-05 removes it)', () => {
-    it('delegates to getPushTargets(userId, "EVIDENCE_REMINDER")', async () => {
-      const spy = jest.spyOn(service, 'getPushTargets').mockResolvedValueOnce({ enabled: true, subscriptions: [] });
-
-      const result = await service.getReminderTargets(userId);
-
-      expect(spy).toHaveBeenCalledWith(userId, 'EVIDENCE_REMINDER');
-      expect(result).toEqual({ enabled: true, subscriptions: [] });
-    });
-  });
-
   describe('pruneSubscription', () => {
     it('deletes the row by id', async () => {
       await service.pruneSubscription('sub-1');

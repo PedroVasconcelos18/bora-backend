@@ -133,15 +133,6 @@ export class PushService {
   }
 
   /**
-   * Temporary bridge so `PushSenderService` (Plan 11-04) keeps compiling
-   * without edits this wave — Plan 12-05 deletes this method (and this
-   * comment) once it rewires the sender to call `getPushTargets` directly.
-   */
-  async getReminderTargets(userId: string): Promise<ReminderTargets> {
-    return this.getPushTargets(userId, 'EVIDENCE_REMINDER');
-  }
-
-  /**
    * D-09 dead-subscription removal: the single delete the Plan 11-04
    * listener calls when a push service answers 404/410. Swallows a
    * record-not-found error — the row already being gone is not a failure.
