@@ -6,6 +6,7 @@ import { PushAdminController } from './push-admin.controller';
 import { PushService } from './push.service';
 import { PushPreferencesService } from './push-preferences.service';
 import { PushSenderService } from './push-sender.service';
+import { PushAdminService } from './push-admin.service';
 import { PushListener } from './push.listener';
 import { AdminGuard } from '../admin/admin.guard';
 
@@ -21,11 +22,13 @@ import { AdminGuard } from '../admin/admin.guard';
  * preference endpoints (Plan 12-04: `GET`/`POST /push/preferences`) live on
  * the sibling `PushPreferencesController` registered alongside it; the
  * admin-only manual-trigger route lives on a third controller
- * (Discretion #5). PushSenderService and the event listener registered
- * below are the Plan 11-04 pair that turns `evidence.reminder` into an
- * actual send — the listener needs no export, like the in-app listener it
- * is discovered automatically by the event-emitter's provider scan. The
- * guard is registered here too
+ * (Discretion #5), backed by `PushAdminService` (Quick task 260802-by6,
+ * generalizing the trigger into a per-type preview/send bench — not
+ * exported, nothing outside this module needs it). PushSenderService and
+ * the event listener registered below are the Plan 11-04 pair that turns
+ * `evidence.reminder` into an actual send — the listener needs no export,
+ * like the in-app listener it is discovered automatically by the
+ * event-emitter's provider scan. The guard is registered here too
  * because Nest resolves a class-referenced guard from the host module's own
  * injector, and it otherwise only lives in AdminModule. PushService remains
  * exported alongside 'PUSH_PROVIDER' as earlier plans left it;
@@ -42,6 +45,7 @@ import { AdminGuard } from '../admin/admin.guard';
     PushService,
     PushPreferencesService,
     PushSenderService,
+    PushAdminService,
     PushListener,
     AdminGuard,
   ],
