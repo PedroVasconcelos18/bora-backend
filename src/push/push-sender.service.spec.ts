@@ -253,5 +253,105 @@ describe('PushSenderService', () => {
 
       expect(pushService.getPushTargets).toHaveBeenCalledWith('user-1', 'CHALLENGE_FINALIZED');
     });
+
+    it('without options, calls getPushTargets with exactly two arguments — no third argument leaks', async () => {
+      pushService.getPushTargets.mockResolvedValue({ enabled: true, subscriptions: [] });
+
+      await service.sendForNotification(row);
+
+      expect(pushService.getPushTargets).toHaveBeenCalledWith('user-1', 'CHALLENGE_ACTIVATED');
+      expect(pushService.getPushTargets.mock.calls[0]).toHaveLength(2);
+    });
+
+    it('with { ignorePreference: true }, repasses it as the third argument to getPushTargets', async () => {
+      pushService.getPushTargets.mockResolvedValue({ enabled: true, subscriptions: [] });
+
+      await service.sendForNotification(row, { ignorePreference: true });
+
+      expect(pushService.getPushTargets).toHaveBeenCalledWith(
+        'user-1',
+        'CHALLENGE_ACTIVATED',
+        { ignorePreference: true },
+      );
+    });
+  });
+
+  describe('options passthrough (Quick task 260802-by6)', () => {
+    it('sendEvidenceReminder without options calls getPushTargets with exactly two arguments', async () => {
+      await service.sendEvidenceReminder('user-1', '2026-08-01', ['challenge-1']);
+
+      expect(pushService.getPushTargets).toHaveBeenCalledWith('user-1', 'EVIDENCE_REMINDER');
+      expect(pushService.getPushTargets.mock.calls[0]).toHaveLength(2);
+    });
+
+    it('sendEvidenceReminder with options repasses the third argument to getPushTargets', async () => {
+      await service.sendEvidenceReminder('user-1', '2026-08-01', ['challenge-1'], {
+        ignorePreference: true,
+      });
+
+      expect(pushService.getPushTargets).toHaveBeenCalledWith('user-1', 'EVIDENCE_REMINDER', {
+        ignorePreference: true,
+      });
+    });
+  });
+
+  describe('buildEvidenceReminderPayload', () => {
+    it('with 1 challenge id, returns the single-challenge payload', async () => {
+      const result = await service.buildEvidenceReminderPayload('2026-08-01', ['challenge-1']);
+
+      expect(result).toEqual({
+        title: '📸 Bora',
+        body: 'Falta a sua evidência de hoje no Corrida matinal',
+        url: '/challenges/challenge-1',
+        tag: 'evidence-reminder-2026-08-01',
+      });
+    });
+
+    it('with 3 challenge ids, returns the aggregated payload and never queries prisma.challenge.findUnique', async () => {
+      const result = await service.buildEvidenceReminderPayload('2026-08-01', [
+        'c1',
+        'c2',
+        'c3',
+      ]);
+
+      expect(result).toEqual({
+        title: '📸 Bora',
+        body: 'Você tem 3 desafios esperando evidência hoje',
+        url: '/home',
+        tag: 'evidence-reminder-2026-08-01',
+      });
+      expect(prisma.challenge.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('with 1 id whose challenge no longer exists and no fallbackTitle, returns null', async () => {
+      prisma.challenge.findUnique.mockResolvedValue(null);
+
+      const result = await service.buildEvidenceReminderPayload('2026-08-01', ['fake']);
+
+      expect(result).toBeNull();
+    });
+
+    it('sendEvidenceReminder sends nothing when the single referenced challenge no longer exists (unchanged behavior)', async () => {
+      prisma.challenge.findUnique.mockResolvedValue(null);
+
+      await service.sendEvidenceReminder('user-1', '2026-08-01', ['fake']);
+
+      expect(push.send).not.toHaveBeenCalled();
+    });
+
+    it('with 1 id whose challenge no longer exists but a fallbackTitle is given, uses the fallback title', async () => {
+      prisma.challenge.findUnique.mockResolvedValue(null);
+
+      const result = await service.buildEvidenceReminderPayload('2026-08-01', ['fake'], {
+        fallbackTitle: 'Corrida matinal',
+      });
+
+      expect(result).toEqual({
+        title: '📸 Bora',
+        body: 'Falta a sua evidência de hoje no Corrida matinal',
+        url: '/challenges/fake',
+        tag: 'evidence-reminder-2026-08-01',
+      });
+    });
   });
 });

@@ -1,8 +1,8 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { IPushProvider, PushPayload as ProviderPushPayload } from './interfaces/push-provider.interface';
-import { PushService, ReminderTarget } from './push.service';
+import { PushService, PushTargetOptions, ReminderTarget } from './push.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { PUSH_CONFIG_BY_TYPE, PushNotificationRow } from './config/push-copy.config';
+import { PUSH_CONFIG_BY_TYPE, PushNotificationRow, PushPayload } from './config/push-copy.config';
 
 /**
  * PushSenderService — turns a persisted `notification` row into an actual
@@ -45,20 +45,53 @@ export class PushSenderService {
    * `challengeIds` is whatever `PushListener` coalesced for this user/day —
    * one entry when the person has exactly one pending challenge, more than
    * one when several fired inside the same coalescing window (Discretion #1).
+   *
+   * `options` (Quick task 260802-by6) is repassed as the third argument of
+   * `getPushTargets` untouched — when `undefined`, `getPushTargets` is
+   * called with exactly two arguments so existing `toHaveBeenCalledWith`
+   * assertions with two arguments keep passing.
    */
   async sendEvidenceReminder(
     userId: string,
     evidenceDate: string,
     challengeIds: string[],
+    options?: PushTargetOptions,
   ): Promise<void> {
     // Step 1 — the SC-2 gate. Eligibility for *who gets a reminder at all*
     // stays entirely the untouched cron's call; this only decides whether
     // that person also wanted it on their phone.
-    const targets = await this.pushService.getPushTargets(userId, 'EVIDENCE_REMINDER');
+    const targets = options
+      ? await this.pushService.getPushTargets(userId, 'EVIDENCE_REMINDER', options)
+      : await this.pushService.getPushTargets(userId, 'EVIDENCE_REMINDER');
     if (!targets.enabled || targets.subscriptions.length === 0) {
       return;
     }
 
+    const payload = await this.buildEvidenceReminderPayload(evidenceDate, challengeIds);
+    if (!payload) {
+      return;
+    }
+
+    await this.sendToSubscriptions(targets.subscriptions, payload, 'EVIDENCE_REMINDER');
+  }
+
+  /**
+   * The single source of `EVIDENCE_REMINDER`'s copy — extracted from
+   * `sendEvidenceReminder` (Quick task 260802-by6) so the admin dry-run
+   * preview renders the SAME text a real send would, without duplicating
+   * the literal strings anywhere. `PUSH_CONFIG_BY_TYPE.EVIDENCE_REMINDER
+   * .buildPayload` still throws by design (D12-02) — nothing here calls it.
+   *
+   * Returns `null` exactly when `sendEvidenceReminder`'s old early-return
+   * fired (the single referenced challenge no longer exists AND no
+   * `fallbackTitle` was supplied) — the caller decides what "nothing to
+   * send" means for it.
+   */
+  async buildEvidenceReminderPayload(
+    evidenceDate: string,
+    challengeIds: string[],
+    opts?: { fallbackTitle?: string },
+  ): Promise<PushPayload | null> {
     const uniqueChallengeIds = [...new Set(challengeIds)];
 
     let body: string;
@@ -69,20 +102,22 @@ export class PushSenderService {
         where: { id: uniqueChallengeIds[0] },
         select: { title: true },
       });
+      const title = challenge?.title ?? opts?.fallbackTitle;
       // Same defensive shape as the in-app listener: a challenge that no
-      // longer exists by send time means nothing to point the tap at.
-      if (!challenge) {
-        return;
+      // longer exists by send time (and no fallback was given) means
+      // nothing to point the tap at.
+      if (!title) {
+        return null;
       }
 
-      body = `Falta a sua evidência de hoje no ${challenge.title}`;
+      body = `Falta a sua evidência de hoje no ${title}`;
       url = `/challenges/${uniqueChallengeIds[0]}`;
     } else {
       body = `Você tem ${uniqueChallengeIds.length} desafios esperando evidência hoje`;
       url = '/home';
     }
 
-    const payload = {
+    return {
       // Camera emoji from EMOJI_BY_TYPE, plain "Bora" — bora-frontend/src/lib/notifications.ts:46.
       title: '📸 Bora',
       body,
@@ -92,17 +127,20 @@ export class PushSenderService {
       // No `actions` — iOS/Android disagree on action-button support and
       // SC-1 needs both platforms identical (11-UI-SPEC.md).
     };
-
-    await this.sendToSubscriptions(targets.subscriptions, payload, 'EVIDENCE_REMINDER');
   }
 
   /**
    * The generalized path (Phase 12): any of the 9 `NotificationType` rows
    * the funnel persists becomes a push here, driven entirely by
    * `PUSH_CONFIG_BY_TYPE`. Adding a 10th type never touches this method.
+   *
+   * `options` (Quick task 260802-by6) is repassed as the third argument of
+   * `getPushTargets` untouched — see `sendEvidenceReminder`'s docblock.
    */
-  async sendForNotification(row: PushNotificationRow): Promise<void> {
-    const targets = await this.pushService.getPushTargets(row.userId, row.type);
+  async sendForNotification(row: PushNotificationRow, options?: PushTargetOptions): Promise<void> {
+    const targets = options
+      ? await this.pushService.getPushTargets(row.userId, row.type, options)
+      : await this.pushService.getPushTargets(row.userId, row.type);
     if (!targets.enabled || targets.subscriptions.length === 0) {
       return;
     }
