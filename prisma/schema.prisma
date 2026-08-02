@@ -13,24 +13,24 @@ datasource db {
 }
 
 model User {
-  id                     String                  @id @default(uuid())
-  email                  String                  @unique
-  name                   String
-  passwordHash           String                  @map("password_hash")
-  createdAt              DateTime                @default(now()) @map("created_at")
+  id                      String                   @id @default(uuid())
+  email                   String                   @unique
+  name                    String
+  passwordHash            String                   @map("password_hash")
+  createdAt               DateTime                 @default(now()) @map("created_at")
   // Legacy single "primary" Pix key — kept in sync with pixKeys[0] so the
   // payout/refund fallback (participant.pixKey ?? user.pixKey) is untouched.
-  pixKey                 String?                 @map("pix_key")
+  pixKey                  String?                  @map("pix_key")
   // Up to 5 saved Pix keys (feedback: múltiplas chaves). Source of truth for
   // the profile editor + the pay-time dropdown; pixKey mirrors the first one.
-  pixKeys                String[]                @default([]) @map("pix_keys")
-  refreshTokens          RefreshToken[]
-  passwordResetTokens    PasswordResetToken[]
-  participants           Participant[]
-  challenges             Challenge[]             @relation("CreatedChallenges")
-  notifications          Notification[]
-  pushSubscriptions      PushSubscription[]
-  notificationPreference NotificationPreference?
+  pixKeys                 String[]                 @default([]) @map("pix_keys")
+  refreshTokens           RefreshToken[]
+  passwordResetTokens     PasswordResetToken[]
+  participants            Participant[]
+  challenges              Challenge[]              @relation("CreatedChallenges")
+  notifications           Notification[]
+  pushSubscriptions       PushSubscription[]
+  notificationPreferences NotificationPreference[]
 
   @@map("users")
 }
@@ -263,17 +263,25 @@ model PushSubscription {
   @@map("push_subscriptions")
 }
 
-// D-08: "quero lembrete" is exactly 1 row per user, separate from the
-// per-device subscription above — it survives a phone swap. Deliberately a
-// single boolean column, not a per-type preference table (NOTIF-06 stays
-// deferred, CONTEXT.md Discretion #3).
+// D12-07: one row per (user, type), registering ONLY deviations from that
+// type's default. Absence of a row means the type's `defaultEnabled` in
+// `PUSH_CONFIG_BY_TYPE` (bora-backend/src/push/config/push-copy.config.ts)
+// applies — the table never carries a row that just repeats the default.
+// The device subscription (`PushSubscription`, per-device, above) stays the
+// master gate: `PushService.getPushTargets` reads it FIRST and only
+// consults this table when at least one subscription exists, so a person
+// who never activated push never gets a row read for them at all. This
+// replaced the Phase 11 single boolean-per-user shape (NOTIF-06 deferral
+// resolved) via the `notification_preference_per_type` migration.
 model NotificationPreference {
-  id                   String   @id @default(uuid())
-  userId               String   @unique @map("user_id")
-  user                 User     @relation(fields: [userId], references: [id])
-  pushRemindersEnabled Boolean  @default(false) @map("push_reminders_enabled")
-  createdAt            DateTime @default(now()) @map("created_at")
-  updatedAt            DateTime @updatedAt @map("updated_at")
+  id        String           @id @default(uuid())
+  userId    String           @map("user_id")
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  enabled   Boolean
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
 
+  @@unique([userId, type])
   @@map("notification_preferences")
 }
