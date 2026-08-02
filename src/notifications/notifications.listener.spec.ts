@@ -358,8 +358,26 @@ describe('NotificationsListener (NOTIF-02, D-04/D-06 audience)', () => {
         userId: 'user-1',
         type: 'EVIDENCE_REMINDER',
         entityId: 'participant-1:2026-07-13',
-        payload: { challengeTitle: 'Corrida', challengeId: 'challenge-1' },
+        payload: {
+          challengeTitle: 'Corrida',
+          challengeId: 'challenge-1',
+          evidenceDate: '2026-07-13',
+        },
       });
+    });
+
+    it('breaks if evidenceDate goes missing from the persisted payload (D12-02 — PushListener needs it post-migration)', async () => {
+      prisma.challenge.findUnique.mockResolvedValueOnce({ title: 'Corrida' });
+
+      await listener.handleEvidenceReminder({
+        participantId: 'participant-1',
+        userId: 'user-1',
+        challengeId: 'challenge-1',
+        evidenceDate: '2026-07-13',
+      });
+
+      const call = notifications.create.mock.calls[0][0];
+      expect(call.payload).toHaveProperty('evidenceDate', '2026-07-13');
     });
   });
 
