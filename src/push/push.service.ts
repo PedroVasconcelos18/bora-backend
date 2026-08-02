@@ -22,6 +22,22 @@ export interface ReminderTargets {
 }
 
 /**
+ * `ignorePreference` exists ONLY for `PushAdminService`'s operator test
+ * route (Quick task 260802-by6): it skips the `notification_preferences`
+ * read so a default-off type like `EVIDENCE_SUBMITTED` (D12-04) is still
+ * testable without the operator flipping a toggle first. It NEVER skips the
+ * device-subscription porteiro — zero `PushSubscription` rows still means
+ * `{ enabled: false, subscriptions: [] }` with the bypass on. Every
+ * production caller (`push.listener.ts`, `sendEvidenceReminder`,
+ * `sendForNotification` called without options) omits this parameter
+ * entirely, so `notification_preferences` keeps being read exactly as
+ * before (PIT-2).
+ */
+export interface PushTargetOptions {
+  ignorePreference?: boolean;
+}
+
+/**
  * Owns `push_subscriptions` + `notification_preferences`. D12-07 replaces
  * the Phase 11 single-boolean-per-user shape: the device subscription is
  * the master gate (no subscription = nothing sent, no preference even
@@ -113,8 +129,20 @@ export class PushService {
    * ever reading `notification_preferences`. Only when at least one device
    * is subscribed does it consult the per-type override, falling back to
    * `PUSH_CONFIG_BY_TYPE[type].defaultEnabled` when no override row exists.
+   *
+   * `options.ignorePreference` (Quick task 260802-by6) short-circuits right
+   * after the subscription read: with at least one device it returns
+   * `{ enabled: true, subscriptions }` WITHOUT ever calling
+   * `notification_preferences.findUnique`; with zero devices it returns the
+   * same empty result as the default path. This bypass exists only for the
+   * admin push-test endpoint and must never be reachable from a real
+   * notification send.
    */
-  async getPushTargets(userId: string, type: NotificationType): Promise<ReminderTargets> {
+  async getPushTargets(
+    userId: string,
+    type: NotificationType,
+    options?: PushTargetOptions,
+  ): Promise<ReminderTargets> {
     const subscriptions = await this.prisma.pushSubscription.findMany({
       where: { userId },
       select: { id: true, endpoint: true, p256dh: true, auth: true },
@@ -122,6 +150,10 @@ export class PushService {
 
     if (subscriptions.length === 0) {
       return { enabled: false, subscriptions: [] };
+    }
+
+    if (options?.ignorePreference) {
+      return { enabled: true, subscriptions };
     }
 
     const override = await this.prisma.notificationPreference.findUnique({

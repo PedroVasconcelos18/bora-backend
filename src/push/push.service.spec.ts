@@ -191,6 +191,72 @@ describe('PushService (D12-07 per-type preference — T-11-07/08/09, T-12-09/10/
         where: { userId_type: { userId, type: 'CHALLENGE_ACTIVATED' } },
       });
     });
+
+    describe('ignorePreference bypass (Quick task 260802-by6)', () => {
+      it('without a third argument, keeps reading notification_preferences and an override disabling the type still empties the result', async () => {
+        prisma.pushSubscription.findMany.mockResolvedValueOnce([
+          { id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' },
+        ]);
+        prisma.notificationPreference.findUnique.mockResolvedValueOnce({ enabled: false });
+
+        const result = await service.getPushTargets(userId, 'CHALLENGE_ACTIVATED');
+
+        expect(prisma.notificationPreference.findUnique).toHaveBeenCalledTimes(1);
+        expect(result).toEqual({ enabled: false, subscriptions: [] });
+      });
+
+      it('with { ignorePreference: true } and at least one subscription, returns enabled without ever reading notification_preferences', async () => {
+        const subs = [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }];
+        prisma.pushSubscription.findMany.mockResolvedValueOnce(subs);
+
+        const result = await service.getPushTargets(userId, 'EVIDENCE_SUBMITTED', {
+          ignorePreference: true,
+        });
+
+        expect(result).toEqual({ enabled: true, subscriptions: subs });
+        expect(prisma.notificationPreference.findUnique).not.toHaveBeenCalled();
+      });
+
+      it('with { ignorePreference: true }, an override row disabling the type is overridden — the bypass wins', async () => {
+        const subs = [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }];
+        prisma.pushSubscription.findMany.mockResolvedValueOnce(subs);
+
+        const result = await service.getPushTargets(userId, 'EVIDENCE_REMINDER', {
+          ignorePreference: true,
+        });
+
+        expect(result).toEqual({ enabled: true, subscriptions: subs });
+        expect(prisma.notificationPreference.findUnique).not.toHaveBeenCalled();
+      });
+
+      it('with { ignorePreference: true } and zero subscriptions, the device porteiro still wins — no invented target', async () => {
+        prisma.pushSubscription.findMany.mockResolvedValueOnce([]);
+
+        const result = await service.getPushTargets(userId, 'EVIDENCE_SUBMITTED', {
+          ignorePreference: true,
+        });
+
+        expect(result).toEqual({ enabled: false, subscriptions: [] });
+        expect(prisma.notificationPreference.findUnique).not.toHaveBeenCalled();
+      });
+
+      it('with { ignorePreference: false } explicit, behaves identically to the default (reads the preference)', async () => {
+        prisma.pushSubscription.findMany.mockResolvedValueOnce([
+          { id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' },
+        ]);
+        prisma.notificationPreference.findUnique.mockResolvedValueOnce(null);
+
+        const result = await service.getPushTargets(userId, 'INVITE_RECEIVED', {
+          ignorePreference: false,
+        });
+
+        expect(prisma.notificationPreference.findUnique).toHaveBeenCalledTimes(1);
+        expect(result).toEqual({
+          enabled: true,
+          subscriptions: [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }],
+        });
+      });
+    });
   });
 
   describe('pruneSubscription', () => {
