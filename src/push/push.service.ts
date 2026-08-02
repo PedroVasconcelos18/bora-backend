@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { Prisma } from '../generated/prisma/client.js';
+import { NotificationType, Prisma } from '../generated/prisma/client.js';
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
+import { PUSH_CONFIG_BY_TYPE } from './config/push-copy.config';
 
 export interface PushStatus {
   enabled: boolean;
@@ -21,10 +22,12 @@ export interface ReminderTargets {
 }
 
 /**
- * Owns `push_subscriptions` + `notification_preferences` (D-08: a device
- * subscription and the user's single reminder preference are two separate
- * concepts, kept in step here but never merged into one row — the
- * preference survives a phone swap, the subscription doesn't).
+ * Owns `push_subscriptions` + `notification_preferences`. D12-07 replaces
+ * the Phase 11 single-boolean-per-user shape: the device subscription is
+ * the master gate (no subscription = nothing sent, no preference even
+ * read), and `notification_preferences` now holds one row per (user, type)
+ * ONLY for deviations from that type's `PUSH_CONFIG_BY_TYPE[type].defaultEnabled`
+ * — absence of a row means the default applies.
  *
  * Every method takes `userId` as an explicit parameter and every write/read
  * is scoped by it. PushController resolves that userId exclusively from
@@ -41,9 +44,12 @@ export class PushService {
    * browser profile that changed accounts must not keep delivering to the
    * old one.
    *
-   * Subscribing IS the opt-in: the only way to switch `pushRemindersEnabled`
-   * on in this phase is to activate on a device (D-08 still keeps the
-   * preference and the subscription as two separate concepts/rows).
+   * Never touches `notification_preferences` (Pitfall 1, 12-RESEARCH.md):
+   * the frontend's `usePushSubscription` self-reconciliation calls this
+   * endpoint on its own, without any user gesture, whenever it detects the
+   * server lost the device's subscription — writing a preference here would
+   * let that background call silently revert per-type choices the person
+   * never touched in that session.
    */
   async upsertSubscription(userId: string, dto: CreateSubscriptionDto): Promise<PushStatus> {
     await this.prisma.pushSubscription.upsert({
@@ -61,12 +67,6 @@ export class PushService {
       },
     });
 
-    await this.prisma.notificationPreference.upsert({
-      where: { userId },
-      create: { userId, pushRemindersEnabled: true },
-      update: { pushRemindersEnabled: true },
-    });
-
     return this.getStatus(userId);
   }
 
@@ -75,56 +75,70 @@ export class PushService {
    * userId, never `delete` by endpoint alone (T-11-07) — an endpoint
    * supplied by a caller must never be able to remove another person's
    * device row.
+   *
+   * Never touches `notification_preferences` either (same Pitfall 1 as
+   * `upsertSubscription` above) — removing the last device must not erase
+   * per-type overrides the person set while they had one.
    */
   async deleteSubscription(userId: string, endpoint: string): Promise<PushStatus> {
     await this.prisma.pushSubscription.deleteMany({ where: { endpoint, userId } });
-
-    const remaining = await this.prisma.pushSubscription.count({ where: { userId } });
-    if (remaining === 0) {
-      await this.prisma.notificationPreference.upsert({
-        where: { userId },
-        create: { userId, pushRemindersEnabled: false },
-        update: { pushRemindersEnabled: false },
-      });
-    }
 
     return this.getStatus(userId);
   }
 
   /**
    * GET /push/status — the database half of the Discretion #4 "ativo" badge
-   * intersection (the browser half is computed client-side).
+   * intersection (the browser half is computed client-side). `enabled` now
+   * means "this user has at least one device subscribed" — per-type
+   * preference no longer fits this endpoint's shape (it's N rows now,
+   * served by `GET /push/preferences`, Plan 12-04). The response shape
+   * `{ enabled, endpoints }` is unchanged, so `derivePushCardState` in
+   * `bora-frontend` needs no edit.
    */
   async getStatus(userId: string): Promise<PushStatus> {
-    const [preference, subscriptions] = await Promise.all([
-      this.prisma.notificationPreference.findUnique({ where: { userId } }),
-      this.prisma.pushSubscription.findMany({ where: { userId }, select: { endpoint: true } }),
-    ]);
+    const subscriptions = await this.prisma.pushSubscription.findMany({
+      where: { userId },
+      select: { endpoint: true },
+    });
 
     return {
-      enabled: preference?.pushRemindersEnabled ?? false,
+      enabled: subscriptions.length > 0,
       endpoints: subscriptions.map((s) => s.endpoint),
     };
   }
 
   /**
-   * The single read the Plan 11-04 listener uses. When the preference is
-   * disabled, returns an empty subscription list without querying rows
-   * further — the gate that makes SC-2 true: someone who never activated
-   * receives nothing.
+   * D12-07's read: the subscription is the porteiro (gatekeeper) — checked
+   * FIRST, and if there are zero subscriptions this returns empty without
+   * ever reading `notification_preferences`. Only when at least one device
+   * is subscribed does it consult the per-type override, falling back to
+   * `PUSH_CONFIG_BY_TYPE[type].defaultEnabled` when no override row exists.
    */
-  async getReminderTargets(userId: string): Promise<ReminderTargets> {
-    const preference = await this.prisma.notificationPreference.findUnique({ where: { userId } });
-    if (!preference?.pushRemindersEnabled) {
-      return { enabled: false, subscriptions: [] };
-    }
-
+  async getPushTargets(userId: string, type: NotificationType): Promise<ReminderTargets> {
     const subscriptions = await this.prisma.pushSubscription.findMany({
       where: { userId },
       select: { id: true, endpoint: true, p256dh: true, auth: true },
     });
 
-    return { enabled: true, subscriptions };
+    if (subscriptions.length === 0) {
+      return { enabled: false, subscriptions: [] };
+    }
+
+    const override = await this.prisma.notificationPreference.findUnique({
+      where: { userId_type: { userId, type } },
+    });
+    const enabled = override?.enabled ?? PUSH_CONFIG_BY_TYPE[type].defaultEnabled;
+
+    return enabled ? { enabled: true, subscriptions } : { enabled: false, subscriptions: [] };
+  }
+
+  /**
+   * Temporary bridge so `PushSenderService` (Plan 11-04) keeps compiling
+   * without edits this wave — Plan 12-05 deletes this method (and this
+   * comment) once it rewires the sender to call `getPushTargets` directly.
+   */
+  async getReminderTargets(userId: string): Promise<ReminderTargets> {
+    return this.getPushTargets(userId, 'EVIDENCE_REMINDER');
   }
 
   /**

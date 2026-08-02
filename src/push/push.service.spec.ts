@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateSubscriptionDto } from './dto/create-subscription.dto';
 import { Prisma } from '../generated/prisma/client.js';
 
-describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
+describe('PushService (D12-07 per-type preference — T-11-07/08/09, T-12-09/10/11)', () => {
   let service: PushService;
   let prisma: {
     pushSubscription: {
@@ -15,7 +15,6 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
       delete: jest.Mock;
     };
     notificationPreference: {
-      upsert: jest.Mock;
       findUnique: jest.Mock;
     };
   };
@@ -39,7 +38,6 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
         delete: jest.fn().mockResolvedValue({}),
       },
       notificationPreference: {
-        upsert: jest.fn().mockResolvedValue({}),
         findUnique: jest.fn().mockResolvedValue(null),
       },
     };
@@ -52,8 +50,7 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
   });
 
   describe('upsertSubscription', () => {
-    it('creates one subscription row and enables the preference for a brand-new endpoint', async () => {
-      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ pushRemindersEnabled: true });
+    it('creates one subscription row and never writes notification_preferences (Pitfall 1)', async () => {
       prisma.pushSubscription.findMany.mockResolvedValueOnce([{ endpoint }]);
 
       const result = await service.upsertSubscription(userId, dto);
@@ -64,13 +61,7 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
           create: expect.objectContaining({ userId, endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }),
         }),
       );
-      expect(prisma.notificationPreference.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { userId },
-          create: expect.objectContaining({ userId, pushRemindersEnabled: true }),
-          update: expect.objectContaining({ pushRemindersEnabled: true }),
-        }),
-      );
+      expect((prisma.notificationPreference as unknown as Record<string, unknown>).upsert).toBeUndefined();
       expect(result).toEqual({ enabled: true, endpoints: [endpoint] });
     });
 
@@ -97,41 +88,25 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
 
     it('deletes nothing for an endpoint belonging to another user (deleteMany matches zero rows)', async () => {
       prisma.pushSubscription.deleteMany.mockResolvedValueOnce({ count: 0 });
-      prisma.pushSubscription.count.mockResolvedValueOnce(3);
 
       await service.deleteSubscription(otherUserId, endpoint);
 
       expect(prisma.pushSubscription.deleteMany).toHaveBeenCalledWith({
         where: { endpoint, userId: otherUserId },
       });
-      expect(prisma.notificationPreference.upsert).not.toHaveBeenCalled();
     });
 
-    it('disables the preference when it leaves the user with zero rows', async () => {
-      prisma.pushSubscription.count.mockResolvedValueOnce(0);
+    it('never writes notification_preferences, even when it leaves the user with zero subscriptions (Pitfall 1)', async () => {
+      prisma.pushSubscription.findMany.mockResolvedValueOnce([]);
 
       await service.deleteSubscription(userId, endpoint);
 
-      expect(prisma.notificationPreference.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { userId },
-          update: expect.objectContaining({ pushRemindersEnabled: false }),
-        }),
-      );
-    });
-
-    it('keeps the preference enabled when the user still has other rows', async () => {
-      prisma.pushSubscription.count.mockResolvedValueOnce(2);
-
-      await service.deleteSubscription(userId, endpoint);
-
-      expect(prisma.notificationPreference.upsert).not.toHaveBeenCalled();
+      expect((prisma.notificationPreference as unknown as Record<string, unknown>).upsert).toBeUndefined();
     });
   });
 
   describe('getStatus', () => {
     it('returns enabled=false and an empty endpoint list for a user who never subscribed', async () => {
-      prisma.notificationPreference.findUnique.mockResolvedValueOnce(null);
       prisma.pushSubscription.findMany.mockResolvedValueOnce([]);
 
       const result = await service.getStatus(userId);
@@ -139,8 +114,7 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
       expect(result).toEqual({ enabled: false, endpoints: [] });
     });
 
-    it("returns the user's own endpoints only, scoped by userId", async () => {
-      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ pushRemindersEnabled: true });
+    it("returns enabled=true and the user's own endpoints only, scoped by userId, without reading preferences", async () => {
       prisma.pushSubscription.findMany.mockResolvedValueOnce([{ endpoint }, { endpoint: 'https://x/2' }]);
 
       const result = await service.getStatus(userId);
@@ -148,32 +122,85 @@ describe('PushService (D-08 persistence — T-11-07/08/09)', () => {
       expect(prisma.pushSubscription.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { userId } }),
       );
+      expect(prisma.notificationPreference.findUnique).not.toHaveBeenCalled();
       expect(result).toEqual({ enabled: true, endpoints: [endpoint, 'https://x/2'] });
     });
   });
 
-  describe('getReminderTargets', () => {
-    it('returns an empty subscription list when the preference is disabled, even if rows exist', async () => {
-      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ pushRemindersEnabled: false });
+  describe('getPushTargets', () => {
+    it('returns empty with zero subscriptions WITHOUT consulting notification_preferences at all (D12-07 porteiro)', async () => {
+      prisma.pushSubscription.findMany.mockResolvedValueOnce([]);
 
-      const result = await service.getReminderTargets(userId);
+      const result = await service.getPushTargets(userId, 'EVIDENCE_SUBMITTED');
 
       expect(result).toEqual({ enabled: false, subscriptions: [] });
-      expect(prisma.pushSubscription.findMany).not.toHaveBeenCalled();
+      expect(prisma.notificationPreference.findUnique).not.toHaveBeenCalled();
     });
 
-    it('returns the subscriptions with delivery keys when the preference is enabled', async () => {
-      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ pushRemindersEnabled: true });
+    it('falls back to the type default (enabled) when there is a subscription but no override row', async () => {
+      const subs = [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }];
+      prisma.pushSubscription.findMany.mockResolvedValueOnce(subs);
+      prisma.notificationPreference.findUnique.mockResolvedValueOnce(null);
+
+      const result = await service.getPushTargets(userId, 'INVITE_RECEIVED');
+
+      expect(result).toEqual({ enabled: true, subscriptions: subs });
+    });
+
+    it('falls back to the type default (disabled) for EVIDENCE_SUBMITTED when there is no override row', async () => {
       prisma.pushSubscription.findMany.mockResolvedValueOnce([
         { id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' },
       ]);
+      prisma.notificationPreference.findUnique.mockResolvedValueOnce(null);
+
+      const result = await service.getPushTargets(userId, 'EVIDENCE_SUBMITTED');
+
+      expect(result).toEqual({ enabled: false, subscriptions: [] });
+    });
+
+    it('returns empty when an override row disables the type, even though a subscription exists', async () => {
+      prisma.pushSubscription.findMany.mockResolvedValueOnce([
+        { id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' },
+      ]);
+      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ enabled: false });
+
+      const result = await service.getPushTargets(userId, 'EVIDENCE_REMINDER');
+
+      expect(result).toEqual({ enabled: false, subscriptions: [] });
+    });
+
+    it('returns subscriptions when an override row enables EVIDENCE_SUBMITTED (default-off type)', async () => {
+      const subs = [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }];
+      prisma.pushSubscription.findMany.mockResolvedValueOnce(subs);
+      prisma.notificationPreference.findUnique.mockResolvedValueOnce({ enabled: true });
+
+      const result = await service.getPushTargets(userId, 'EVIDENCE_SUBMITTED');
+
+      expect(result).toEqual({ enabled: true, subscriptions: subs });
+    });
+
+    it('queries the override by the composite userId_type key, scoped to the given user and type', async () => {
+      prisma.pushSubscription.findMany.mockResolvedValueOnce([
+        { id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' },
+      ]);
+      prisma.notificationPreference.findUnique.mockResolvedValueOnce(null);
+
+      await service.getPushTargets(userId, 'CHALLENGE_ACTIVATED');
+
+      expect(prisma.notificationPreference.findUnique).toHaveBeenCalledWith({
+        where: { userId_type: { userId, type: 'CHALLENGE_ACTIVATED' } },
+      });
+    });
+  });
+
+  describe('getReminderTargets (temporary bridge for PushSenderService, Plan 12-05 removes it)', () => {
+    it('delegates to getPushTargets(userId, "EVIDENCE_REMINDER")', async () => {
+      const spy = jest.spyOn(service, 'getPushTargets').mockResolvedValueOnce({ enabled: true, subscriptions: [] });
 
       const result = await service.getReminderTargets(userId);
 
-      expect(result).toEqual({
-        enabled: true,
-        subscriptions: [{ id: 'sub-1', endpoint, p256dh: 'p256dh-value', auth: 'auth-value' }],
-      });
+      expect(spy).toHaveBeenCalledWith(userId, 'EVIDENCE_REMINDER');
+      expect(result).toEqual({ enabled: true, subscriptions: [] });
     });
   });
 
