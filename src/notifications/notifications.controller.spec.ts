@@ -1,5 +1,6 @@
 import { Test } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsService } from './notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -30,7 +31,11 @@ describe('NotificationsController (V3 ownership/IDOR — T-09-01..04)', () => {
 
     const moduleRef = await Test.createTestingModule({
       controllers: [NotificationsController],
-      providers: [NotificationsService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        NotificationsService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: EventEmitter2, useValue: { emit: jest.fn() } },
+      ],
     }).compile();
 
     controller = moduleRef.get(NotificationsController);
