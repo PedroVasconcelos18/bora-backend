@@ -273,6 +273,8 @@ export class NotificationsListener {
       payload: {
         challengeTitle: challenge.title,
         challengeId: payload.challengeId,
+        // D12-02: um consumidor futuro do funil vai precisar desta data; extraí-la do entityId composto acoplaria esse consumidor a um formato de string definido aqui.
+        evidenceDate: payload.evidenceDate,
       },
     });
   }
