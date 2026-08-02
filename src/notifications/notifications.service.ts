@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma, NotificationType } from '../generated/prisma/client.js';
 
@@ -20,7 +21,10 @@ const LIST_TAKE_MAX = 100;
  */
 @Injectable()
 export class NotificationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
   /**
    * Single-row create. A P2002 (duplicate on @@unique([userId,type,entityId]))
@@ -29,10 +33,19 @@ export class NotificationsService {
    * fire-and-forget discipline: this is called from an @OnEvent listener,
    * never blocking the domain flow that emitted the event). Any other error
    * is re-thrown.
+   *
+   * `notification.created` is emitted ONLY after the row is REALLY
+   * persisted (D12-01): the P2002 branch returns before ever reaching the
+   * emit, so a duplicate webhook or a re-run reconciliation job never
+   * announces a row that didn't just get created. This service does not
+   * know or import `PushListener` (Phase 12) — it is a plain consumer of
+   * this event, exactly like `NotificationsListener` is a plain consumer of
+   * the 8 domain events upstream of this one.
    */
   async create(input: CreateNotificationInput): Promise<void> {
+    let row;
     try {
-      await this.prisma.notification.create({
+      row = await this.prisma.notification.create({
         data: {
           userId: input.userId,
           type: input.type,
@@ -46,19 +59,25 @@ export class NotificationsService {
       }
       throw err;
     }
+
+    this.eventEmitter.emit('notification.created', row);
   }
 
   /**
-   * Batch create for fan-out (D-04 group events). `skipDuplicates: true`
-   * gives the same dedupe semantics as `create()`'s caught P2002, in a
-   * single query instead of N.
+   * Batch create for fan-out (D-04 group events). `createManyAndReturn`
+   * with `skipDuplicates: true` compiles to `INSERT ... ON CONFLICT DO
+   * NOTHING ... RETURNING` on PostgreSQL, so the returned array holds only
+   * the rows that were REALLY inserted — never the whole input batch
+   * (D12-01, confirmed against the real Postgres by
+   * `test/notifications-funnel.e2e-spec.ts`, 12-RESEARCH.md hypothesis A2).
+   * One `notification.created` is emitted per returned row, in a loop.
    */
   async createMany(inputs: CreateNotificationInput[]): Promise<void> {
     if (inputs.length === 0) {
       return;
     }
 
-    await this.prisma.notification.createMany({
+    const rows = await this.prisma.notification.createManyAndReturn({
       data: inputs.map((input) => ({
         userId: input.userId,
         type: input.type,
@@ -67,6 +86,10 @@ export class NotificationsService {
       })),
       skipDuplicates: true,
     });
+
+    for (const row of rows) {
+      this.eventEmitter.emit('notification.created', row);
+    }
   }
 
   /**
