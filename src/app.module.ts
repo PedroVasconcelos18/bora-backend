@@ -19,6 +19,7 @@ import { ProfileModule } from './profile/profile.module';
 import { FinalizationModule } from './finalization/finalization.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { PushModule } from './push/push.module';
+import { ContactModule } from './contact/contact.module';
 
 @Module({
   imports: [
@@ -49,6 +50,7 @@ import { PushModule } from './push/push.module';
     // same globally-registered event bus — the in-app notifications
     // listener above stays untouched (SC-3).
     PushModule,
+    ContactModule,
   ],
 })
 export class AppModule {}

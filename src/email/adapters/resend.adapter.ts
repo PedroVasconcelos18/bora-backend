@@ -47,6 +47,7 @@ export class ResendAdapter implements IEmailProvider {
       to: [params.to],
       subject: params.subject,
       html: params.html,
+      replyTo: params.replyTo,
     });
 
     if (error) {
