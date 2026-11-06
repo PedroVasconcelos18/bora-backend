@@ -85,6 +85,19 @@ export class AuthController {
     return { message: 'Sessão encerrada.' };
   }
 
+  /** DELETE /auth/account — exclusão de conta (anonimiza; ver AuthService.deleteAccount). */
+  @Delete('account')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async deleteAccount(
+    @CurrentUser() user: UserPayload,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    await this.authService.deleteAccount(user.id);
+    this.clearAuthCookies(res);
+    return { message: 'Conta excluída.' };
+  }
+
   @Get('me')
   @UseGuards(JwtAuthGuard)
   me(@CurrentUser() user: UserPayload) {

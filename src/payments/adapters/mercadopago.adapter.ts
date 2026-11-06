@@ -109,6 +109,14 @@ export class MercadoPagoAdapter implements IPaymentProvider {
 
     const expiresAt = new Date(Date.now() + params.expirationMinutes * 60_000);
 
+    // Per-charge webhook so delivery doesn't depend on the MP panel config.
+    // `source_news=webhooks` suppresses the legacy IPN call (no data.id → fails
+    // x-signature → 403 retries). MP rejects non-https URLs, so dev omits it.
+    const base = (this.config.get<string>('PUBLIC_BASE_URL') ?? '').replace(/\/+$/, '');
+    const notificationUrl = base.startsWith('https://')
+      ? `${base}/payments/webhook?source_news=webhooks`
+      : undefined;
+
     const result = await this.payment.create({
       body: {
         transaction_amount: params.amount,
@@ -117,6 +125,7 @@ export class MercadoPagoAdapter implements IPaymentProvider {
         external_reference: params.externalReference,
         date_of_expiration: expiresAt.toISOString(),
         payer: { email: params.payerEmail },
+        ...(notificationUrl && { notification_url: notificationUrl }),
       },
       requestOptions: { idempotencyKey: params.idempotencyKey },
     });

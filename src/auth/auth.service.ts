@@ -158,6 +158,34 @@ export class AuthService {
     });
   }
 
+  /**
+   * Exclusão de conta (exigência das lojas): anonimiza a identidade em vez de
+   * apagar a linha. Pix keys, payments, participations, evidences and votes
+   * stay — the payout/refund fallback (participant.pixKey ?? user.pixKey)
+   * must keep working, and LGPD allows retaining financial records.
+   */
+  async deleteAccount(userId: string): Promise<void> {
+    const anonEmail = `excluida-${userId}@excluida.invalid`;
+    await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.findUnique({ where: { id: userId }, select: { email: true } });
+      if (!user) return;
+      await tx.invite.updateMany({
+        where: { targetEmail: { equals: user.email, mode: 'insensitive' } },
+        data: { targetEmail: anonEmail },
+      });
+      await tx.refreshToken.deleteMany({ where: { userId } });
+      await tx.passwordResetToken.deleteMany({ where: { userId } });
+      await tx.notification.deleteMany({ where: { userId } });
+      await tx.pushSubscription.deleteMany({ where: { userId } });
+      await tx.notificationPreference.deleteMany({ where: { userId } });
+      // Empty hash: login looks up by email first, and that email is gone.
+      await tx.user.update({
+        where: { id: userId },
+        data: { name: 'Conta excluída', email: anonEmail, passwordHash: '' },
+      });
+    });
+  }
+
   private issueAccessToken(user: UserPayload): string {
     return this.jwtService.sign(
       { sub: user.id, email: user.email, name: user.name },

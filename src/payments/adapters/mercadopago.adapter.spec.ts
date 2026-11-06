@@ -226,3 +226,45 @@ describe('MercadoPagoAdapter.getPayment — 404 normalization', () => {
     expect(caught).not.toBeInstanceOf(PaymentNotFoundError);
   });
 });
+
+describe('MercadoPagoAdapter.createPixCharge — notification_url', () => {
+  const params = {
+    amount: 10,
+    description: 'Bora',
+    externalReference: 'p1',
+    expirationMinutes: 60,
+    payerEmail: 'a@b.com',
+    idempotencyKey: 'k1',
+  };
+
+  const build = (publicBaseUrl: string | undefined) => {
+    const env: Record<string, string | undefined> = {
+      MERCADOPAGO_ACCESS_TOKEN: 'APP_USR-abc',
+      PUBLIC_BASE_URL: publicBaseUrl,
+    };
+    const adapter = new MercadoPagoAdapter({
+      get: jest.fn((k: string) => env[k]),
+    } as unknown as ConfigService);
+    const create = jest.fn().mockResolvedValue({
+      id: 1,
+      status: 'pending',
+      point_of_interaction: { transaction_data: { qr_code: 'q', qr_code_base64: 'b', ticket_url: 't' } },
+    });
+    (adapter['payment'] as unknown as { create: jest.Mock }).create = create;
+    return { adapter, create };
+  };
+
+  it('sends the https webhook URL in webhooks-only format, so delivery does not depend on the MP panel', async () => {
+    const { adapter, create } = build('https://api.borajuntos.app/');
+    await adapter.createPixCharge(params);
+    expect(create.mock.calls[0][0].body.notification_url).toBe(
+      'https://api.borajuntos.app/payments/webhook?source_news=webhooks',
+    );
+  });
+
+  it('omits notification_url for a non-https base (local dev) — MP rejects it', async () => {
+    const { adapter, create } = build('http://localhost:3000');
+    await adapter.createPixCharge(params);
+    expect(create.mock.calls[0][0].body).not.toHaveProperty('notification_url');
+  });
+});
